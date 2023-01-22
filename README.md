@@ -23,3 +23,5 @@ The grid shapes are all based on the 1km US National grid, but with some additio
  - within each of those grid tiles, there are nine 1km x 1km squares, lettered A B C in the top row, D E F in the middle, and G H I on the bottom.
 
 ![grid-structure](https://user-images.githubusercontent.com/4411956/213900531-b28ea587-0d0f-4323-a11f-ad913df0bfa9.png)
+
+CRS note: this grid, like the National Grid, is based off of a [Universal Trans Mercator]([url](https://en.wikipedia.org/wiki/Universal_Transverse_Mercator_coordinate_system)) (UTM) coordinate system. For Skagit County, that means EPSG:26910 - NAD83 / UTM zone 10N.
