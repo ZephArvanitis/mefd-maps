@@ -26,13 +26,10 @@ from qgis import processing
 
 class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
     """
-    This is an example algorithm that takes a vector layer and
-    creates a new identical one.
-
-    It is meant to be used as an example of how to create your own
-    algorithms and explain methods and variables used to do it. An
-    algorithm like this will be available in all elements, and there
-    is not need for additional work.
+    This takes a Skagit-like grid and adds four new fields to each feature:
+    east gives the map ID of the tile just to the east, west, north,
+    and south the map IDs of the tiles in the expected directions. This
+    is useful for marking neighboring tiles on an atlas.
 
     All Processing algorithms should extend the QgsProcessingAlgorithm
     class.
@@ -99,7 +96,7 @@ class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
         should provide a basic description about what the algorithm does and the
         parameters and outputs associated with it..
         """
-        return self.tr("Example algorithm short description")
+        return self.tr("Add neighboring grid tiles to a Skagit-like grid")
 
     def initAlgorithm(self, config=None):
         """
@@ -116,7 +113,7 @@ class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
                 [QgsProcessing.TypeVectorAnyGeometry]
             )
         )
-        
+
         # Field as parameter
         self.addParameter(
         QgsProcessingParameterField(
@@ -152,7 +149,17 @@ class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
         second_letter = string.ascii_uppercase[(row  % 3) * 3 + col % 3]
         grid_label = f"{first_letter}{number}{second_letter}"
         return grid_label
-        
+
+    def get_all_included_names(self, source, name_field):
+        """Return a set of all 1kids in the source layer.
+
+        This is so we can omit irrelevant east/west/north/south neighbor
+        annotations and avoid confusion.
+        """
+        features = source.getFeatures()
+        all_names = {feature[name_field] for feature in features}
+        return all_names
+
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
@@ -173,14 +180,12 @@ class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
         # helper text for when a source cannot be evaluated
         if source is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT))
-            
-            
+
         name_field = self.parameterAsString(
             parameters,
             self.NAME_FIELD,
             context)
-            
-                    
+
         fields = source.fields()
         fields.append(QgsField(self.EAST_FIELD_NAME, QVariant.String))
         fields.append(QgsField(self.WEST_FIELD_NAME, QVariant.String))
@@ -209,55 +214,52 @@ class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
         # get features from source
         total = 100.0 / source.featureCount() if source.featureCount() else 0
         features = source.getFeatures()
+        all_names = self.get_all_included_names(source, name_field)
+        feedback.pushInfo(f"All names included: {all_names}")
 
         for current, feature in enumerate(features):
             # Stop the algorithm if cancel button has been clicked
             if feedback.isCanceled():
                 break
-
             feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}')
-            feedback.pushInfo(f"layer has fields {[field.name() for field in source.fields()]}")
+
             field_names = [field.name() for field in source.fields()]
             feature.setFields(source.fields(), False)
-            feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}, {name_field}: {feature[name_field]}')
-            feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}, {name_field}: {feature[name_field]}')
-            
-                
+
             # Get rid of pesky middle-of-the-string spaces
             tile_1kid = "".join(feature[name_field].split())
             tile_row, tile_col = self.get_rowcol_from_1kid(tile_1kid)
-            east = self.get_1kid_from_rowcol(
-                tile_row, tile_col + 1)
-            west = self.get_1kid_from_rowcol(
-                tile_row, tile_col - 1)
-            north = self.get_1kid_from_rowcol(
-                tile_row - 1, tile_col)
-            south = self.get_1kid_from_rowcol(
-                tile_row + 1, tile_col)
-                
-            # Make sure these extra features are in the same order we added the fields above!
+            east = self.get_1kid_from_rowcol(tile_row, tile_col + 1)
+            west = self.get_1kid_from_rowcol(tile_row, tile_col - 1)
+            north = self.get_1kid_from_rowcol(tile_row - 1, tile_col)
+            south = self.get_1kid_from_rowcol(tile_row + 1, tile_col)
+            
+            # Drop any values not in the full grid we're neighboring
+            feedback.pushInfo(f"grid tile {feature[name_field]} has east {east}, west {west}, north {north}, south {south}")
+            east = east if east in all_names else ""
+            west = west if west in all_names else ""
+            north = north if north in all_names else ""
+            south = south if south in all_names else ""
+            
+            feedback.pushInfo(f"grid tile {feature[name_field]} has east {east}, west {west}, north {north}, south {south}")
+            feedback.pushInfo("")
+
+            # Make sure these extra features are in the same order we added
+            # the fields above!
             feature.setAttributes(feature.attributes() + [east, west, north, south])
 
-                
             # Add a feature in the sink
             sink.addFeature(feature, QgsFeatureSink.FastInsert)
-                
+
             # Update the progress bar
             feedback.setProgress(int(current * total))
-            
-            
-            
+
         # To run another Processing algorithm as part of this algorithm, you can use
         # processing.run(...). Make sure you pass the current context and feedback
         # to processing.run to ensure that all temporary layer outputs are available
         # to the executed algorithm, and that the executed algorithm can send feedback
         # reports to the user (and correctly handle cancellation and progress reports!)
 
-        # Return the results of the algorithm. In this case our only result is
-        # the feature sink which contains the processed features, but some
-        # algorithms may return multiple feature sinks, calculated numeric
-        # statistics, etc. These should all be included in the returned
-        # dictionary, with keys matching the feature corresponding parameter
-        # or output names.
+        # Return the results of the algorithm.
         return {self.OUTPUT: dest_id}
 
