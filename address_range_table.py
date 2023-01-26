@@ -11,10 +11,15 @@
 ***************************************************************************
 """
 import string
+from collections import defaultdict
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant 
 from qgis.core import (QgsProcessing,
                        QgsProcessingParameterField,
+                       QgsProcessingParameterExpression,
+                       QgsExpression,
+                       QgsExpressionContext,
+                       QgsExpressionContextUtils,
                        QgsFeatureSink,
                        QgsField,
                        QgsFields,
@@ -135,12 +140,19 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 '',
                 self.ADDRESS))
         # TODO: try with QgsProcessingParameterExpression
+        # self.addParameter(
+        #     QgsProcessingParameterField(
+        #         self.STREET_FIELD,
+        #         'Choose street name field',
+        #         '',
+        #        self.ADDRESS))
         self.addParameter(
-            QgsProcessingParameterField(
+            QgsProcessingParameterExpression(
                 self.STREET_FIELD,
-                'Choose street name field',
+                'Define full street name',
                 '',
-                self.ADDRESS))
+                self.ADDRESS)
+            )
 
         # TODO: add district layer and computation.
 
@@ -199,10 +211,15 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             parameters,
             self.ADDRESS_FIELD,
             context)
-        street_name_field = self.parameterAsString(
+        # street_name_field = self.parameterAsString(
+        #     parameters,
+        #     self.STREET_FIELD,
+        #     context)
+        street_name_exp_str = self.parameterAsString(
             parameters,
             self.STREET_FIELD,
             context)
+        street_name_expression = QgsExpression(street_name_exp_str)
 
         # Generate list of fields
         fields = QgsFields()
@@ -230,10 +247,6 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             f'Grid CRS is {grid_crs}, Address CRS is {address_crs}')
 
-        # Compute the number of steps to display within the progress bar and
-        # get features from source
-        # TODO which layer do we count for progress??
-        # total = 100.0 / source.featureCount() if source.featureCount() else 0
         grid_features = grid_source.getFeatures()
         address_features = address_source.getFeatures()
 
@@ -270,6 +283,15 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             context, address_with_grid_info)
 
         address_with_grid_features = address_with_grid_layer.getFeatures()
+        # Compute the number of steps to display within the progress bar and
+        # get features from source
+        total = 100.0 / address_with_grid_layer.featureCount() if address_with_grid_layer.featureCount() else 0
+        
+        # Initialize expression context
+        expression_context = QgsExpressionContext()
+        expression_context.appendScopes(
+            QgsExpressionContextUtils.globalProjectLayerScopes(
+                address_with_grid_layer))
 
         # We're going to iterate over attributes and add 'em to a dict of
         # form:
@@ -277,17 +299,39 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         #   (street_name, grid_tile): (min_number, max_number),
         #   ...
         # }
-        
+        number_grid_dict = defaultdict(lambda: (float('inf'), float('-inf')))
         for i, feature in enumerate(address_with_grid_features):
             if feedback.isCanceled():
                 break
-            feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}')
-
+            
             # Configure field names for index access to attributes
             feature.setFields(address_with_grid_layer.fields(), False)
+            map_id = feature[name_field]
+            address_number = feature[street_number_field]
+            
+            # Set context and evaluate street name expression
+            expression_context.setFeature(feature)
+            street_name = street_name_expression.evaluate(expression_context)
+            # feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}')
+            # feedback.pushInfo(f'fields {[field.name() for field in address_with_grid_layer.fields()]}')
+            # feedback.pushInfo(f'map id {map_id}')
+            # feedback.pushInfo(f'just computed street name {street_name}')
+            
+            # skip streets outside the grid tiles
+            if map_id is None:
+                continue
+
+            index_tuple = (street_name, map_id)
+            
+            curr_min, curr_max = number_grid_dict[index_tuple]
+            new_min = min(curr_min, address_number)
+            new_max = max(curr_max, address_number)
+            number_grid_dict[index_tuple] = (new_min, new_max)
+            
+            feedback.setProgress(int(i * total))
 
 
-
+        feedback.pushInfo(f"resulting dict {number_grid_dict}")
         # for current, feature in enumerate(features):
         #     # Get rid of pesky middle-of-the-string spaces
         #     tile_1kid = "".join(feature[name_field].split())
