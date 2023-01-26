@@ -235,14 +235,10 @@ class GridNeighborsProcessingAlgorithm(QgsProcessingAlgorithm):
             south = self.get_1kid_from_rowcol(tile_row + 1, tile_col)
             
             # Drop any values not in the full grid we're neighboring
-            feedback.pushInfo(f"grid tile {feature[name_field]} has east {east}, west {west}, north {north}, south {south}")
             east = east if east in all_names else ""
             west = west if west in all_names else ""
             north = north if north in all_names else ""
             south = south if south in all_names else ""
-            
-            feedback.pushInfo(f"grid tile {feature[name_field]} has east {east}, west {west}, north {north}, south {south}")
-            feedback.pushInfo("")
 
             # Make sure these extra features are in the same order we added
             # the fields above!
