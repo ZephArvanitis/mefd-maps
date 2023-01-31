@@ -139,13 +139,6 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 'Choose street number field',
                 '',
                 self.ADDRESS))
-        # TODO: try with QgsProcessingParameterExpression
-        # self.addParameter(
-        #     QgsProcessingParameterField(
-        #         self.STREET_FIELD,
-        #         'Choose street name field',
-        #         '',
-        #        self.ADDRESS))
         self.addParameter(
             QgsProcessingParameterExpression(
                 self.STREET_FIELD,
@@ -166,21 +159,14 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-    def get_all_included_names(self, source, name_field):
-        """Return a set of all 1kids in the source layer.
-        """
-        features = source.getFeatures()
-        all_names = {feature[name_field] for feature in features}
-        return all_names
-
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
         """
-
         # Retrieve the feature source and sink. The 'dest_id' variable is used
         # to uniquely identify the feature sink, and must be included in the
         # dictionary returned by the processAlgorithm function.
+        # Grid info
         grid_source = self.parameterAsSource(
             parameters,
             self.GRID,
@@ -211,10 +197,6 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             parameters,
             self.ADDRESS_FIELD,
             context)
-        # street_name_field = self.parameterAsString(
-        #     parameters,
-        #     self.STREET_FIELD,
-        #     context)
         street_name_exp_str = self.parameterAsString(
             parameters,
             self.STREET_FIELD,
@@ -229,14 +211,11 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField("Map page", QVariant.String))
 
         # Create sink object
-        # TODO: figure out how to do this without geometry in final layer,
-        # we just want the table
         (sink, dest_id) = self.parameterAsSink(
                 parameters,
                 self.OUTPUT,
                 context,
                 fields,
-                #QgsWkbTypes.NoGeometry,
                 crs=address_source.sourceCrs())
         if sink is None:
             raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
@@ -286,7 +265,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         # Compute the number of steps to display within the progress bar and
         # get features from source
         total = 100.0 / address_with_grid_layer.featureCount() if address_with_grid_layer.featureCount() else 0
-        
+
         # Initialize expression context
         expression_context = QgsExpressionContext()
         expression_context.appendScopes(
@@ -303,12 +282,12 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         for i, feature in enumerate(address_with_grid_features):
             if feedback.isCanceled():
                 break
-            
+
             # Configure field names for index access to attributes
             feature.setFields(address_with_grid_layer.fields(), False)
             map_id = feature[name_field]
             address_number = feature[street_number_field]
-            
+
             # Set context and evaluate street name expression
             expression_context.setFeature(feature)
             street_name = street_name_expression.evaluate(expression_context)
@@ -316,47 +295,32 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             # feedback.pushInfo(f'fields {[field.name() for field in address_with_grid_layer.fields()]}')
             # feedback.pushInfo(f'map id {map_id}')
             # feedback.pushInfo(f'just computed street name {street_name}')
-            
+
             # skip streets outside the grid tiles
             if map_id is None:
                 continue
 
             index_tuple = (street_name, map_id)
-            
+
             curr_min, curr_max = number_grid_dict[index_tuple]
             new_min = min(curr_min, address_number)
             new_max = max(curr_max, address_number)
             number_grid_dict[index_tuple] = (new_min, new_max)
-            
+
             feedback.setProgress(int(i * total))
 
 
         feedback.pushInfo(f"resulting dict {number_grid_dict}")
-        # for current, feature in enumerate(features):
-        #     # Get rid of pesky middle-of-the-string spaces
-        #     tile_1kid = "".join(feature[name_field].split())
-        #     tile_row, tile_col = self.get_rowcol_from_1kid(tile_1kid)
-        #     east = self.get_1kid_from_rowcol(tile_row, tile_col + 1)
-        #     west = self.get_1kid_from_rowcol(tile_row, tile_col - 1)
-        #     north = self.get_1kid_from_rowcol(tile_row - 1, tile_col)
-        #     south = self.get_1kid_from_rowcol(tile_row + 1, tile_col)
-
-        #     # Drop any values not in the full grid we're neighboring
-        #     east = east if east in all_names else ""
-        #     west = west if west in all_names else ""
-        #     north = north if north in all_names else ""
-        #     south = south if south in all_names else ""
-
-        #     # Make sure these extra features are in the same order we added
-        #     # the fields above!
-        #     feature.setAttributes(feature.attributes() + [east, west, north, south])
-
-        #     # Add a feature in the sink
-        #     sink.addFeature(feature, QgsFeatureSink.FastInsert)
-
-        #     # Update the progress bar
-        #     feedback.setProgress(int(current * total))
-
+        for (street_name, map_id), (address_min, address_max) in number_grid_dict.items():
+            # Order of attributes matters! Make sure this matches order
+            # defined above
+            # fields.append(QgsField("Street name", QVariant.String))
+            # fields.append(QgsField("Start address", QVariant.String))
+            # fields.append(QgsField("End address", QVariant.String))
+            # fields.append(QgsField("Map page", QVariant.String))
+            attributes = [street_name, address_min, address_max, map_id]
+            feature.setAttributes(attributes)
+            sink.addFeature(feature, QgsFeatureSink.FastInsert)
 
         # Return the results of the algorithm.
         return {self.OUTPUT: dest_id}
