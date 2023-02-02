@@ -208,6 +208,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField("Street name", QVariant.String))
         fields.append(QgsField("Start address", QVariant.String))
         fields.append(QgsField("End address", QVariant.String))
+        fields.append(QgsField("Notes", QVariant.String))
         fields.append(QgsField("Map page", QVariant.String))
 
         # Create sink object
@@ -278,7 +279,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         #   (street_name, grid_tile): (min_number, max_number),
         #   ...
         # }
-        number_grid_dict = defaultdict(lambda: (float('inf'), float('-inf')))
+        number_grid_dict = defaultdict(set)
         for i, feature in enumerate(address_with_grid_features):
             if feedback.isCanceled():
                 break
@@ -302,23 +303,46 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
 
             index_tuple = (street_name, map_id)
 
-            curr_min, curr_max = number_grid_dict[index_tuple]
-            new_min = min(curr_min, address_number)
-            new_max = max(curr_max, address_number)
-            number_grid_dict[index_tuple] = (new_min, new_max)
+            # add current address to address set
+            number_grid_dict[index_tuple] |= {address_number}
 
             feedback.setProgress(int(i * total))
 
 
         feedback.pushInfo(f"resulting dict {number_grid_dict}")
-        for (street_name, map_id), (address_min, address_max) in number_grid_dict.items():
+        for (street_name, map_id), address_number_set in number_grid_dict.items():
             # Order of attributes matters! Make sure this matches order
             # defined above
             # fields.append(QgsField("Street name", QVariant.String))
             # fields.append(QgsField("Start address", QVariant.String))
             # fields.append(QgsField("End address", QVariant.String))
             # fields.append(QgsField("Map page", QVariant.String))
-            attributes = [street_name, address_min, address_max, map_id]
+            address_min = min(address_number_set)
+            address_max = max(address_number_set)
+
+            # generate notes
+            notes = []
+            addresses_even = {address for address in address_number_set
+                              if address % 2 == 0}
+            addresses_odd = {address for address in address_number_set
+                             if address % 2 == 1}
+            n_even = len(addresses_even)
+            n_odd = len(addresses_odd)
+            if n_even == 0 and n_odd > 0:
+                notes.append("ODD ONLY")
+            if n_odd == 0 and n_even > 0:
+                notes.append("EVEN ONLY")
+            all_grids_for_street = [grid_tile
+                                    for street, grid_tile in number_grid_dict.keys()
+                                    if street == street_name]
+            if len(all_grids_for_street) == 1:
+                # intentionally override even/odd only, since all addresses
+                # is strictly more informative
+                notes = ["ALL ADDRESSES"]
+            notes_str = ", ".join(notes)
+
+            attributes = [street_name, address_min, address_max,
+                          notes_str, map_id]
             feature.setAttributes(attributes)
             sink.addFeature(feature, QgsFeatureSink.FastInsert)
 
