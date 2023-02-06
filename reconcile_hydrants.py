@@ -167,7 +167,7 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.DISTINCT,
-                self.tr('Distinctive hydrants'),
+                self.tr('Distinct hydrants'),
             )
         )
 
@@ -236,15 +236,16 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.invalidSinkError(parameters,
                                                                self.CORRESPONDENCE))
 
-        # (sink, dest_id) = self.parameterAsSink(
-        #         parameters,
-        #         self.DISTINCT,
-        #         context,
-        #         distinct_fields,
-        #         crs=self.DISTANCE_CRS)
-        # if sink is None:
-        #     raise QgsProcessingException(self.invalidSinkError(parameters,
-        #                                                        self.DISTINCT))
+        (distinct_sink, distinct_dest_id) = self.parameterAsSink(
+                parameters,
+                self.DISTINCT,
+                context,
+                distinct_fields,
+                QgsWkbTypes.Point,
+                crs=self.DISTANCE_CRS)
+        if distinct_sink is None:
+            raise QgsProcessingException(self.invalidSinkError(parameters,
+                                                               self.DISTINCT))
 
         # Send some information to the user
         hydrant1_crs = hydrant1_source.sourceCrs()
@@ -261,7 +262,7 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
         n2 = len(hydrant2_features)
 
         # Step 1: pairwise distances
-        # distances[i, j] is distance from hydrant i in first datset to
+        # distances[i, j] is distance from hydrant i in first dataset to
         # hydrant j in second
         distances = np.zeros((n1, n2))
         d = QgsDistanceArea()
@@ -310,16 +311,18 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
             distances[i, j] = distance_feet
             feedback.setProgress(int(counter * total))
 
-        feedback.pushInfo(f"Done calculating distances: {distances}")
+        feedback.pushInfo(f"Done calculating distances")
 
         # Step 2: find hydrants that are mutually closest to each other,
         # flag distinct hydrants
-        min_in_col = distances == distances.min(axis=0)
-        min_in_row = (distances.T == distances.min(axis=1)).T
+        min_in_col = distances.min(axis=0)
+        is_min_in_col = distances == min_in_col
+        min_in_row = distances.min(axis=1)
+        is_min_in_row = (distances.T == min_in_row).T
 
         # Matching hydrants are mutually closest to each other...
-        mutually_close = min_in_col & min_in_row
-        # ...and are separated by a distance less than x
+        mutually_close = is_min_in_col & is_min_in_row
+        # ...and are separated by a distance less than x (this is feet)
         MAX_MATCH_DISTANCE = 250  # IDK, seems legit?
         within_buffer = distances < MAX_MATCH_DISTANCE
         matching_hydrants = mutually_close & within_buffer
@@ -329,7 +332,6 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(f"Building matching hydrant layer ({len(pairs)} "
                           " total)")
         total = 100.0 / (n1 * n2)
-        feedback.pushInfo(f"fields {[f for f in correspondence_fields]}")
         for counter, (i, j) in enumerate(pairs):
             if feedback.isCanceled():
                 break
@@ -353,7 +355,6 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
             # adding the feature to the layer. So convert to a string
             # first, and it'll get converted back to a number when added.
             attributes = [str(hydrant1_id), str(hydrant2_id), str(distance)]
-            feedback.pushInfo(f"{attributes}")
 
             # Generate geometry: a line connecting the two points
             match_geometry = QgsGeometry.fromPolyline(
@@ -362,7 +363,6 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
             feature = QgsFeature(correspondence_fields)
             feature.setGeometry(match_geometry)
             feature.setAttributes(attributes)
-            feedback.pushInfo(f"feature is {feature}, fields {[f for f in feature.fields()]}, attributes {feature.attributes()}, geometry {feature.geometry()}")
             correspondence_sink.addFeature(feature, QgsFeatureSink.FastInsert)
             feedback.setProgress(int(counter * total))
 
@@ -371,77 +371,59 @@ class ReconcileHydrantsProcessingAlgorithm(QgsProcessingAlgorithm):
 
         # 2b: non-matching hydrants, that is, any row or column without a
         # True in `matching_hydrants`
-        hydrant1_nonmatches = (matching_hydrants.sum(axis=1) == 0).nonzero()
-        hydrant2_nonmatches = (matching_hydrants.sum(axis=0) == 0).nonzero()
-            # distinct_fields = QgsFields()
-            # distinct_fields.append(QgsField("Source data set", QVariant.String))
-            # distinct_fields.append(QgsField("Source hydrant id",
-            #                                 QVariant.String))
-            # distinct_fields.append(QgsField("Nearest hydrant in other dataset",
-            #                                 QVariant.Double))
+        hydrant1_nonmatches = (matching_hydrants.sum(axis=1) == 0
+                               ).nonzero()[0]
+        hydrant2_nonmatches = (matching_hydrants.sum(axis=0) == 0
+                               ).nonzero()[0]
         feedback.pushInfo("Processing distinct hydrants: "
                           f"{len(hydrant1_nonmatches)} in dataset 1, "
                           f"{len(hydrant2_nonmatches)} in dataset 2")
 
-        return {self.CORRESPONDENCE: correspondence_dest_id}
-        for i, feature in enumerate(address_with_grid_features):
+        total = 100.0 / (len(hydrant1_nonmatches) + len(hydrant2_nonmatches))
+        hydrant1_source_name = hydrant1_source.sourceName()
+        for counter, i in enumerate(hydrant1_nonmatches):
             if feedback.isCanceled():
                 break
 
-            # Configure field names for index access to attributes
-            feature.setFields(address_with_grid_layer.fields(), False)
-            map_id = feature[name_field]
-            address_number = feature[street_number_field]
+            hydrant1 = hydrant1_features[i]
+            hydrant1_point = hydrant1_geoms[i]
+            hydrant1.setFields(hydrant1_source.fields(), False)
+            hydrant1_id = hydrant1[hydrant1_id_field]
 
-            # Set context and evaluate street name expression
-            expression_context.setFeature(feature)
-            street_name = street_name_expression.evaluate(expression_context)
-            # feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}')
-            # feedback.pushInfo(f'fields {[field.name() for field in address_with_grid_layer.fields()]}')
-            # feedback.pushInfo(f'map id {map_id}')
-            # feedback.pushInfo(f'just computed street name {street_name}')
+            nearest_distance = min_in_row[i]
 
-            # skip streets outside the grid tiles
-            if map_id is None:
-                continue
+            attributes = [hydrant1_source_name, hydrant1_id,
+                          str(nearest_distance)]
 
-            index_tuple = (street_name, map_id)
-
-            # add current address to address set
-            number_grid_dict[index_tuple] |= {address_number}
-
-            feedback.setProgress(int(i * total))
-
-
-        feedback.pushInfo(f"resulting dict {number_grid_dict}")
-        for (street_name, map_id), address_number_set in number_grid_dict.items():
-            # Order of attributes matters! Make sure this matches order
-            # defined above
-            # fields.append(QgsField("Street name", QVariant.String))
-            # fields.append(QgsField("Start address", QVariant.String))
-            # fields.append(QgsField("End address", QVariant.String))
-            # fields.append(QgsField("Map page", QVariant.String))
-            address_min = min(address_number_set)
-            address_max = max(address_number_set)
-
-            # generate notes
-            notes = []
-            addresses_even = {address for address in address_number_set
-                              if address % 2 == 0}
-            addresses_odd = {address for address in address_number_set
-                             if address % 2 == 1}
-            n_even = len(addresses_even)
-            n_odd = len(addresses_odd)
-            if n_even == 0 and n_odd > 0:
-                notes.append("ODD ONLY")
-            if n_odd == 0 and n_even > 0:
-                notes.append("EVEN ONLY")
-            notes_str = ", ".join(notes)
-            attributes = [street_name, address_min, address_max,
-                          notes_str, map_id]
+            feature = QgsFeature(correspondence_fields)
+            feature.setGeometry(hydrant1_point)
             feature.setAttributes(attributes)
-            sink.addFeature(feature, QgsFeatureSink.FastInsert)
+            distinct_sink.addFeature(feature, QgsFeatureSink.FastInsert)
+            feedback.setProgress(int(counter * total))
 
-        # Return the results of the algorithm.
-        return {self.OUTPUT: dest_id}
 
+        hydrant2_source_name = hydrant2_source.sourceName()
+        for counter, j in enumerate(hydrant2_nonmatches):
+            if feedback.isCanceled():
+                break
+            counter = counter + len(hydrant2_nonmatches)
+            hydrant2 = hydrant2_features[j]
+            hydrant2_point = hydrant2_geoms[j]
+            hydrant2.setFields(hydrant2_source.fields(), False)
+            hydrant2_id = hydrant2[hydrant2_id_field]
+
+            nearest_distance = min_in_col[j]
+
+            attributes = [hydrant2_source_name, hydrant2_id,
+                          str(nearest_distance)]
+
+            feature = QgsFeature(correspondence_fields)
+            feature.setGeometry(hydrant2_point)
+            feature.setAttributes(attributes)
+            distinct_sink.addFeature(feature, QgsFeatureSink.FastInsert)
+            feedback.setProgress(int(counter * total))
+
+        feedback.pushInfo("Done processing distinct hydrants")
+
+        return {self.CORRESPONDENCE: correspondence_dest_id,
+                self.DISTINCT: distinct_dest_id}
