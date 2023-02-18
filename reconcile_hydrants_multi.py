@@ -425,10 +425,6 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             else:
                 # This is a correspondence! Between multiple datasets!
                 # Hooray! Also PANIIIIIIIC!!!!!
-                # pre-merge fields:
-                # QgsField("Source datasets", QVariant.String)
-                # QgsField("Source indices", QVariant.String)
-                # QgsField("Max distance", QVariant.Double)
                 # First, assemble attributes. Just hope the slicing works
                 subgraph = G.subgraph(component).copy()
                 sorted_nodes = sorted(component)
@@ -471,46 +467,6 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                 correspondence_sink.addFeature(feature, QgsFeatureSink.FastInsert)
             # Update progress bar
             feedback.setProgress(int(counter * total))
-
-        # Send some information to the user
-        # feedback.pushInfo(f"Building matching hydrant layer ({len(pairs)} "
-        #                   " total)")
-        # total = 100.0 / (n1 * n2)
-        # for counter, (i, j) in enumerate(pairs):
-        #     if feedback.isCanceled():
-        #         break
-        #     hydrant1 = hydrant1_features[i]
-        #     # All hydrants should be in the cache at this point; stop
-        #     # explicitly checking
-        #     hydrant1_point = self.hydrant_geometries[name1][i].asPoint()
-        #     hydrant1.setFields(hydrant1_source.fields(), False)
-        #     hydrant1_id = hydrant1[hydrant1_id_field]
-
-        #     hydrant2 = hydrant2_features[j]
-        #     hydrant2_point = self.hydrant_geometries[name2][j].asPoint()
-        #     hydrant2.setFields(hydrant2_source.fields(), False)
-        #     hydrant2_id = hydrant2[hydrant2_id_field]
-
-        #     distance = distances[i, j]
-
-        #     # Remember, order here must match the field order.
-        #     # For reasons I don't understand, passing `distance` as it is
-        #     # rather than casting it to a string causes an error when
-        #     # adding the feature to the layer. So convert to a string
-        #     # first, and it'll get converted back to a number when added.
-        #     attributes = [str(hydrant1_id), str(hydrant2_id), str(distance)]
-
-        #     # Generate geometry: a line connecting the two points
-        #     match_geometry = QgsGeometry.fromPolyline(
-        #         [QgsPoint(hydrant1_point), QgsPoint(hydrant2_point)]);
-
-        #     feature = QgsFeature(correspondence_fields)
-        #     feature.setGeometry(match_geometry)
-        #     feature.setAttributes(attributes)
-        #     correspondence_sink.addFeature(feature, QgsFeatureSink.FastInsert)
-        #     feedback.setProgress(int(counter * total))
-
-        # feedback.pushInfo("Done with matching hydrant layer")
 
         return {self.CORRESPONDENCE: correspondence_dest_id,
                 self.DISTINCT: distinct_dest_id}
