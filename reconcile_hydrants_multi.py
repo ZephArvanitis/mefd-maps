@@ -47,34 +47,26 @@ from qgis import processing
 
 class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
     """
-    This takes two layers of hydrant point data (including IDs) and creates:
+    This takes two or more layers of hydrant point data and creates:
         1. a mapping between the layers of hydrants the algorithm thinks
         are the same
         2. a layer of points highlighting where the two datasets differ
         significantly
-
-    All Processing algorithms should extend the QgsProcessingAlgorithm
-    class.
+        3. a "proposed hydrant location" layer with best guesses as to
+        final hydrant locations, with the location chosen based on the
+        first (alphabetical) matching data set.
     """
-
-    # Constants used to refer to parameters and outputs. They will be
-    # used when calling the algorithm from another algorithm, or when
-    # calling from the QGIS console.
     # Hardcode the CRS we'll use for calculating distances: Washington
     # North
     DISTANCE_CRS = QgsCoordinateReferenceSystem("EPSG:2285")
     MAX_MATCH_DISTANCE = 250  # IDK, seems legit?
 
     HYDRANTS = 'HYDRANTS'
-    # HYDRANTS1 = 'HYDRANTS1'
-    # HYDRANTS2 = 'HYDRANTS2'
-    # TODO: figure out what to do re id fields, can I select one for each?
-    # HYDRANTS1_ID_FIELD = 'hydrant1_address_field'
-    # HYDRANTS2_ID_FIELD = 'hydrant2_address_field'
 
     # Output layers
     CORRESPONDENCE = "CORRESPONDENCE"
     DISTINCT = "DISTINCT"
+    PROPOSED = "PROPOSED"
 
     hydrant_geometries = {}  # Will be dict mapping dataset name ->
                              # dict mapping index i -> a qgs geometry
@@ -96,14 +88,14 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'reconcile_hydrants_multi'
+        return 'reconcile_hydrants'
 
     def displayName(self):
         """
         Returns the translated algorithm name, which should be used for any
         user-visible display of the algorithm name.
         """
-        return self.tr('Reconcile 3+ hydrant data sets')
+        return self.tr('Reconcile hydrant data sets')
 
     def group(self):
         """
@@ -129,7 +121,8 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         parameters and outputs associated with it..
         """
         return self.tr("Given 2+ layers of hydrants, create a mapping "
-                       "between them and highlight differences")
+                       "between them, highlight differences, and generate "
+                       "a proposed merged hydrant dataset")
 
     def initAlgorithm(self, config=None):
         """
@@ -143,9 +136,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                     description=self.tr("Select hydrant layers"),
                     layerType=QgsProcessing.TypeVectorPoint))
 
-        # We add a feature sink in which to store our processed features (this
-        # usually takes the form of a newly created vector layer when the
-        # algorithm is run in QGIS).
+        # Add feature sinks for output layers
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.CORRESPONDENCE,
@@ -157,6 +148,14 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFeatureSink(
                 self.DISTINCT,
                 self.tr('Distinct hydrants'),
+                QgsProcessing.TypeVectorPoint
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.PROPOSED,
+                self.tr('Proposed hydrant locations'),
+                QgsProcessing.TypeVectorPoint
             )
         )
 
@@ -277,18 +276,22 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         # All hydrant data
         hydrant_sources = self.parameterAsLayerList(
                 parameters, self.HYDRANTS, context)
-        feedback.pushInfo(f"hydrant sources {hydrant_sources}")
         if hydrant_sources is None:
             raise QgsProcessingException(
                     self.invalidSourceError(parameters, self.HYDRANTS)
                     )
+        feedback.pushInfo(f"hydrant sources {hydrant_sources}")
         if len(hydrant_sources) < 2:
             # TODO find correct error to raise here
             raise Exception("Invalid number of hydrant layers – got "
-                    f"{len(hydrant_sources)} but expected 2+")
+                            f"{len(hydrant_sources)} but expected 2+")
 
         sources_dict = {hydrant_source.name(): hydrant_source
                         for hydrant_source in hydrant_sources}
+        # Selection order dictates which hydrants get priority – priority 0
+        # will beat priority 1, etc.
+        priority_dict = {hydrant_source.name(): i
+                         for i, hydrant_source in enumerate(hydrant_sources)}
 
         # We're going to construct a graph representing which hydrants
         # "correspond" to which across different data sets. The keys in
@@ -356,11 +359,15 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             correspondence_fields.append(field)
 
         distinct_fields = QgsFields()
-        distinct_fields.append(QgsField("Source data set", QVariant.String))
-        distinct_fields.append(QgsField("Source hydrant index",
+        distinct_fields.append(QgsField("Source data sets", QVariant.String))
+        distinct_fields.append(QgsField("Source indices",
                                         QVariant.String))
         for field in merged_fields:
             distinct_fields.append(field)
+
+        # Proposed hydrant locations: same fields as correspondence layer
+        # (max distance will be zero for hydrants in only one dataset)
+        proposed_fields = correspondence_fields
 
         # Create sink object
         (correspondence_sink, correspondence_dest_id) = self.parameterAsSink(
@@ -385,7 +392,18 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.invalidSinkError(parameters,
                                                                self.DISTINCT))
 
-        # TODO: look at graph's connected components and add each to either
+        (proposed_sink, proposed_dest_id) = self.parameterAsSink(
+                parameters,
+                self.PROPOSED,
+                context,
+                proposed_fields,
+                QgsWkbTypes.Point,
+                crs=self.DISTANCE_CRS)
+        if proposed_sink is None:
+            raise QgsProcessingException(self.invalidSinkError(parameters,
+                                                               self.PROPOSED))
+
+        # Look at graph's connected components and add each to either
         # distinct or a correspondence layer. (correspondence should
         # probably have each pair in lines?? idk)
         connected_components = list(nx.connected_components(G))
@@ -422,6 +440,11 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                 feature.setGeometry(hydrant_point)
                 feature.setAttributes(attributes)
                 distinct_sink.addFeature(feature, QgsFeatureSink.FastInsert)
+                # HACK ALERT: just insert a distance of 0 in position 3 of
+                # the attributes, then add to proposed layer
+                attributes.insert(2, 0)
+                feature.setAttributes(attributes)
+                proposed_sink.addFeature(feature, QgsFeatureSink.FastInsert)
             else:
                 # This is a correspondence! Between multiple datasets!
                 # Hooray! Also PANIIIIIIIC!!!!!
@@ -440,17 +463,24 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                 # additional attributes: carry over component hydrants' fields
                 extra_attributes = [None] * len(merged_fields)
                 geom_points = []
+                # proposed_geom will be type (priority, QgsPoint)
+                proposed_geom = (float('inf'), QgsPoint(0, 0))
                 for dataset_name, hydrant_index in sorted_nodes:
                     dataset = sources_dict[dataset_name]
                     hydrant = list(dataset.getFeatures())[hydrant_index]
-                    geom_points.append(
-                        self.hydrant_geometries[dataset_name][hydrant_index])
+                    current_point = self.hydrant_geometries[dataset_name][hydrant_index]
+                    geom_points.append(current_point)
                     # pre-configure fields for this feature (needed?)
                     # False is important as it prevents overriding all values
                     # with null.
                     hydrant.setFields(dataset.fields(), False)
                     fields_slice = slice(*index_range_dict[dataset_name])
                     extra_attributes[fields_slice] = hydrant.attributes()
+                    # update proposed_geom if this point is higher priority
+                    old_priority, _ = proposed_geom
+                    current_priority = priority_dict[dataset_name]
+                    if current_priority < old_priority:
+                        proposed_geom = (current_priority, current_point)
 
                 attributes.extend(extra_attributes)
 
@@ -465,8 +495,13 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                 feature.setGeometry(match_geometry)
                 feature.setAttributes(attributes)
                 correspondence_sink.addFeature(feature, QgsFeatureSink.FastInsert)
+
+                _, proposed_point = proposed_geom
+                feature.setGeometry(proposed_point)
+                proposed_sink.addFeature(feature, QgsFeatureSink.FastInsert)
             # Update progress bar
             feedback.setProgress(int(counter * total))
 
         return {self.CORRESPONDENCE: correspondence_dest_id,
-                self.DISTINCT: distinct_dest_id}
+                self.DISTINCT: distinct_dest_id,
+                self.PROPOSED: proposed_dest_id}
