@@ -4,7 +4,47 @@ Scripts and such involved in the 2023 rework of MEFD's map book
 Unless otherwise noted, these are scripts meant to be run via the QGIS
 processing toolbox.
 
-### Processing scripts
+## Processing scripts
+Processing scripts in this repo fall into a number of categories:
+
+### Address table generation
+A key part of our map book is the ability to quickly look up any address and find what grid tile it's present in. This processing algorithm generates that table and outputs it.
+
+
+### Hydrant reconciliation
+`reconcile_hydrants_multi` takes multiple hydrant datasets and does its best to wrangle them into one final dataset.
+
+**Use notes**
+
+The processing algorithm accepts multiple point layers as input. There are some annoying ways the algorithm depends on the exact names of these layers:
+- the output layers will have the union of input layers' fields, with the layer name prepended to each field name.
+- when multiple datasets "agree" on a hydrant, the *first layer alphabetically* is the location that will be used for the proposed hydrant location.
+
+Based on this, layer names like "0 2023-01 manual hydrants", "1 2023-02 manual hydrants", "2 2023-02 anacortes hydrants", "3 2022-04 MEFD hydrants", etc. are recommended.
+
+**Algorithm notes**
+
+The merging of hydrant datasets is, it turns out, kinda tricky. For some background info, see a [blog post](https://wxyzeph.com/posts/spatial-join/) from mid-2022 with my first attempt. This algorithm basically constructs an [undirected graph](https://en.wikipedia.org/wiki/Graph_(discrete_mathematics)) with a node per dataset/hydrant tuple, and edges representing association between two hydrants across their two layers.
+
+Broadly speaking:
+
+- for each pair of input layers:
+  - calculates all cross-pairwise distances (that is, distances from every hydrant in layer A to every hydrant in layer B)
+  - finds pairs of hydrants that are:
+    - each closest to one another (that is, hydrant i in layer A is closest to hydrant j in layer B of all layer B hydrants, and hydrant j in layer B is closest to hydrant i in layer A of all layer A hydrants)
+    - within a fixed distance of one another (as of 2023-02-17, hardcoded to 250 feet)
+  - all pairs get added as an edge in the undirected graph
+- now that the graph is constructed, iterate over [connected components](https://en.wikipedia.org/wiki/Component_(graph_theory)), each of which represents one proposed hydrant, with potentially multiple nearby locations from different datasets. For each component:
+  - if the hydrant is only present in one dataset:
+    - add it to the *distinct* output layer with a bit of info
+    - add it as-is to the *proposed* output layer
+  - if the hydrant is present in multiple datasets (that is, the connected component contains more than one node):
+    - add lines connecting the multiple locations to the *correspondence* output layer
+    - take a best guess as to actual location, based on the alphabetical priority described above. Add that point and other hydrant info to the *proposed* output layer.
+
+
+
+### Grid generation + labeling
 
 `usng_to_skagit_grid` converts a nice, normal US National Grid 1km tile
 layer into a Skagit-labeled ~~monstrosity~~ layer by doing some fancy
