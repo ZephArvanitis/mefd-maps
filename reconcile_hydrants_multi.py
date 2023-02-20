@@ -8,6 +8,7 @@
 *                                                                         *
 ***************************************************************************
 """
+from collections import Counter
 import itertools
 
 import networkx as nx
@@ -54,6 +55,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
     MAX_MATCH_DISTANCE = 250  # IDK, seems legit?
 
     HYDRANTS = 'HYDRANTS'
+    # CONFIRMED_NEGATIVES = 'CONFIRMED_NEGATIVES'
 
     # Output layers
     CORRESPONDENCE = "CORRESPONDENCE"
@@ -72,9 +74,6 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         self.correspondence_sink = None
         self.proposed_sink = None
 
-        self.distinct_dest_id = None
-        self.correspondence_dest_id = None
-        self.proposed_dest_id = None
         super().__init__()
 
     def tr(self, string):  # pylint: disable=invalid-name
@@ -146,6 +145,12 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                     description=self.tr("Select hydrant layers"),
                     layerType=QgsProcessing.TypeVectorPoint))
 
+        # self.addParameter(
+        #         QgsProcessingParameterMultipleLayers(
+        #             name=self.CONFIRMED_NEGATIVES,
+        #             description=self.tr("Layers with confirmed non-hydrants"),
+        #             layerType=QgsProcessing.TypeVectorPoint))
+
         # Add feature sinks for output layers
         self.addParameter(
             QgsProcessingParameterFeatureSink(
@@ -169,7 +174,77 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-    def getPairwiseCorrespondence(  # pylint: disable=invalid-name
+    def _populate_geometries(self, hydrant_sources):
+        """Populate hydrant geometries in a single CRS.
+        """
+        for hydrant_source in hydrant_sources:
+            crs = hydrant_source.sourceCrs()
+            name = hydrant_source.name()
+
+            hydrant_features = list(hydrant_source.getFeatures())
+
+            feature_count = len(hydrant_features)
+
+            # Cache transformed geometries
+            self.hydrant_geometries[name] = {}  # will be i: geometry
+
+            transform = QgsCoordinateTransform(
+                crs, self.DISTANCE_CRS, QgsProject.instance())
+            for i in range(feature_count):
+                hydrant = hydrant_features[i]
+                # Note: transform transforms in place so we need a separate
+                # geometry variable here
+                geometry = hydrant.geometry()
+                geometry.transform(transform)
+                self.hydrant_geometries[name][i] = geometry
+
+    def _get_pairwise_distances(self, dataset1, dataset2, feedback):
+        """Construct pairwise distance matrix and return it.
+        """
+        name1 = dataset1.name()
+        name2 = dataset2.name()
+
+        assert name1 in self.hydrant_geometries
+        assert name2 in self.hydrant_geometries
+
+        hydrant1_count = len(self.hydrant_geometries[name1])
+        hydrant2_count = len(self.hydrant_geometries[name2])
+
+        # Step 1: pairwise distances
+        # distances[i, j] is distance from hydrant i in first dataset to
+        # hydrant j in second
+        distances = np.zeros((hydrant1_count, hydrant2_count))
+        distance_calculator = QgsDistanceArea()
+        distance_calculator.setSourceCrs(
+                self.DISTANCE_CRS, QgsProject.instance().transformContext())
+        distance_calculator.setEllipsoid(QgsProject.instance().ellipsoid())
+
+        feedback.pushInfo(f"    Calculating {hydrant1_count} x "
+                          f"{hydrant2_count} "
+                          f"= {hydrant1_count * hydrant2_count} distances")
+        total = 100.0 / (hydrant1_count * hydrant2_count)
+        for counter, (i, j) in enumerate(
+                itertools.product(range(hydrant1_count),
+                                  range(hydrant2_count))):
+            if feedback.isCanceled():
+                break
+
+            # Get transformed geometries
+            geom1 = self.hydrant_geometries[name1][i]
+            geom2 = self.hydrant_geometries[name2][j]
+
+            # NOTE: distance in EPSG:2285 is in feet, so that's what we get
+            # here, but convert anyway, just to be safe
+            distance = distance_calculator.measureLine(geom1.asPoint(),
+                                                       geom2.asPoint())
+            distance_feet = distance_calculator.convertLengthMeasurement(
+                distance, QgsUnitTypes.DistanceUnit.DistanceFeet)
+            distances[i, j] = distance_feet
+            feedback.setProgress(int(counter * total))
+
+        return distances
+
+    def _get_pairwise_correspondence(
             self,
             dataset1, dataset2, correspondence_distance_ft, feedback):
         """Get correspondence between hydrants in two layers.
@@ -186,75 +261,12 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
           matching, with a distance of d1, and so on.
         """
         feedback.pushInfo(
-                "Getting pairwise correspondence between "
-                f"{dataset1.sourceName()} and {dataset2.sourceName()}..."
+                "Comparing "
+                f"{dataset1.sourceName()} and {dataset2.sourceName()} "
+                f"using {self.DISTANCE_CRS.authid()}"
                 )
-        hydrant1_crs = dataset1.sourceCrs()
-        hydrant2_crs = dataset2.sourceCrs()
-        feedback.pushInfo(
-            f"Hydrant data 1 CRS is {hydrant1_crs.authid()}, "
-            f"Hydrant data 2 CRS is {hydrant2_crs.authid()}, "
-            f"calculating distances in {self.DISTANCE_CRS.authid()}")
-
-        name1 = dataset1.name()
-        name2 = dataset2.name()
-
-        hydrant1_features = list(dataset1.getFeatures())
-        hydrant2_features = list(dataset2.getFeatures())
-
-        n1 = len(hydrant1_features)
-        n2 = len(hydrant2_features)
-
-        # Step 1: pairwise distances
-        # distances[i, j] is distance from hydrant i in first dataset to
-        # hydrant j in second
-        distances = np.zeros((n1, n2))
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(self.DISTANCE_CRS,
-                       QgsProject.instance().transformContext())
-        distance_calculator.setEllipsoid(QgsProject.instance().ellipsoid())
-
-        # Cache transformed geometries
-        self.hydrant_geometries[name1] = {}  # will be i: geometry
-        self.hydrant_geometries[name2] = {}  # will be i: geometry
-
-        transform1 = QgsCoordinateTransform(
-            hydrant1_crs, self.DISTANCE_CRS, QgsProject.instance())
-        transform2 = QgsCoordinateTransform(
-            hydrant2_crs, self.DISTANCE_CRS, QgsProject.instance())
-        feedback.pushInfo(f"Calculating {n1} x {n2} = {n1 * n2} distances")
-        total = 100.0 / (n1 * n2)
-        for counter, (i, j) in enumerate(itertools.product(range(n1),
-                                                           range(n2))):
-            if feedback.isCanceled():
-                break
-            if i in self.hydrant_geometries[name1]:
-                g1 = self.hydrant_geometries[name1][i]
-            else:
-                hydrant1 = hydrant1_features[i]
-                # Note: transform transforms in place so we need a separate
-                # geometry variable here
-                g1 = hydrant1.geometry()
-                g1.transform(transform1)
-                self.hydrant_geometries[name1][i] = g1
-
-            if j in self.hydrant_geometries[name2]:
-                g2 = self.hydrant_geometries[name2][j]
-            else:
-                hydrant2 = hydrant2_features[j]
-                g2 = hydrant2.geometry()
-                g2.transform(transform2)
-                self.hydrant_geometries[name2][j] = g2
-
-            # NOTE: distance in EPSG:2285 is in feet, so that's what we get
-            # here, but convert anyway, just to be safe
-            distance = distance_calculator.measureLine(g1.asPoint(), g2.asPoint())
-            distance_feet = distance_calculator.convertLengthMeasurement(
-                distance, QgsUnitTypes.DistanceUnit.DistanceFeet)
-            distances[i, j] = distance_feet
-            feedback.setProgress(int(counter * total))
-
-        feedback.pushInfo("Done calculating distances")
+        distances = self._get_pairwise_distances(dataset1, dataset2,
+                                                feedback)
 
         # Step 2: find hydrants that are mutually closest to each other
         is_min_in_col = distances == distances.min(axis=0)
@@ -262,16 +274,15 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
 
         # Matching hydrants are mutually closest to each other...
         mutually_close = is_min_in_col & is_min_in_row
-        # ...and are separated by a distance less than x (this is feet)
+        # ...and are separated by a distance less than x feet
         within_buffer = distances < correspondence_distance_ft
         matching_hydrants = mutually_close & within_buffer
 
-        # 2a: matching hydrants:
         pairs = list(zip(*matching_hydrants.nonzero()))  # (i, j) pairs
         pairs_with_distances = [(i, j, distances[i, j]) for i, j in pairs]
         return pairs_with_distances
 
-    def generate_hydrant_graph(self, hydrant_sources, feedback):
+    def _generate_hydrant_graph(self, hydrant_sources, feedback):
         """
         We're going to construct a graph representing which hydrants
         "correspond" to which across different data sets. The keys in
@@ -292,7 +303,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         # Iterate over every pair of data sources and find connections. Use
         # those to populate a graph
         for dataset1, dataset2 in itertools.combinations(hydrant_sources, 2):
-            pairs = self.getPairwiseCorrespondence(dataset1, dataset2,
+            pairs = self._get_pairwise_correspondence(dataset1, dataset2,
                     self.MAX_MATCH_DISTANCE, feedback)
             # Add dataset names to pairs
             name1 = dataset1.name()
@@ -302,13 +313,12 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                                 for i, j, d in pairs]
             hydrant_graph.add_edges_from(pairs_with_names)
             feedback.pushInfo(
-                f"Hydrant graph has {len(hydrant_graph)} nodes "
-                f"and {len(hydrant_graph.edges())} edges "
-                f"after correspondence between {name1} and {name2}")
+                f"    Hydrant graph has {len(hydrant_graph)} nodes "
+                f"and {len(hydrant_graph.edges())} edges")
 
         return hydrant_graph
 
-    def generate_merged_fields(self, hydrant_sources):
+    def _generate_merged_fields(self, hydrant_sources):
         """Generate merged fields for all hydrant sources
 
         Input:
@@ -344,7 +354,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
 
         return merged_fields, index_range_dict
 
-    def get_extra_attributes(self, name_feature_tuples, index_range_dict):
+    def _get_extra_attributes(self, name_feature_tuples, index_range_dict):
         """Combine attributes of 1+ hydrants into the merged field list
         used by all data sinks
 
@@ -363,7 +373,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             extra_attributes[fields_slice] = hydrant.attributes()
         return extra_attributes
 
-    def add_to_distinct(self, dataset_name, index, hydrant_point,
+    def _add_to_distinct(self, dataset_name, index, hydrant_point,
                         extra_attributes):
         """Add a feature to the distinct sink
         """
@@ -374,7 +384,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         feature.setAttributes(attributes)
         self.distinct_sink.addFeature(feature, QgsFeatureSink.FastInsert)
 
-    def add_to_proposed(self, dataset_name, index, characteristic_distance,
+    def _add_to_proposed(self, dataset_name, index, characteristic_distance,
                         hydrant_point, extra_attributes):
         """Add a feature to the proposed sink
         """
@@ -386,7 +396,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         feature.setAttributes(attributes)
         self.proposed_sink.addFeature(feature, QgsFeatureSink.FastInsert)
 
-    def add_to_correspondence(self, dataset_name, index, characteristic_distance,
+    def _add_to_correspondence(self, dataset_name, index, characteristic_distance,
                         hydrant_line, extra_attributes):
         """Add a feature to the correspondence sink
         """
@@ -398,7 +408,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         feature.setAttributes(attributes)
         self.correspondence_sink.addFeature(feature, QgsFeatureSink.FastInsert)
 
-    def get_max_distance_for_component(self, hydrant_graph, component):
+    def _get_max_distance_for_component(self, hydrant_graph, component):
         """Construct a subgraph of the hydrant graph and get the longest
         distance between two corresponding hydrants.
 
@@ -409,9 +419,8 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
         distances = nx.get_edge_attributes(subgraph, "distance").values()
         return max(distances)
 
-    def populate_sinks(self, hydrant_sources, hydrant_graph,
-                       index_range_dict,
-                       feedback):
+    def _populate_sinks(self, hydrant_sources, hydrant_graph,
+                       index_range_dict, feedback):
         """Take a hydrant graph and process it into the output layers we
         care about.
         """
@@ -433,31 +442,48 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             if feedback.isCanceled():
                 break
             # Each component is just a set of nodes
-            # TODO: error checking: no component should have multiple nodes
-            # from the same original data set.
+            # Error checking: no component should have multiple nodes from
+            # the same original data set.
+            source_name_counts = Counter([name for name, _ in component])
+            if max(source_name_counts.values()) > 1:
+                feedback.pushInfo(
+                        "WARNING! WARNING! A component has two hydrants "
+                        "from the same dataset. This almost always means a "
+                        "weird edge case with multiple datasets. Involved "
+                        f"component: {component}")
 
-            # Add distinct components to the distinct sink
+            # Skip over any components that contain a confirmed negative
+
+            # This doesn't work as is, because it's far too easy to have a
+            # negative match with a real positive when that positive is in
+            # a partial layer like a manual spot check.
+            # if source_names.intersection(confirmed_negative_source_names):
+            #     feedback.pushInfo(f"Skipping component {component} because "
+            #                       "it contains a confirmed negative")
+            #     continue
+
             if len(component) == 1:
+                # This is a distinct (one-dataset) hydrant
                 # With just one node, we're guaranteed to get it from pop
                 dataset_name, index = component.pop()
                 dataset = sources_dict[dataset_name]
                 hydrant = list(dataset.getFeatures())[index]
                 hydrant_point = self.hydrant_geometries[dataset_name][index]
 
-                extra_attributes = self.get_extra_attributes(
+                extra_attributes = self._get_extra_attributes(
                         [(dataset_name, hydrant)], index_range_dict)
 
-                self.add_to_distinct(dataset_name, index, hydrant_point,
-                                     extra_attributes)
-
-                self.add_to_proposed(dataset_name, index, 0,
-                                     hydrant_point, extra_attributes)
+                # Add to appropriate sinks
+                self._add_to_distinct(dataset_name, index, hydrant_point,
+                                      extra_attributes)
+                self._add_to_proposed(dataset_name, index, 0,
+                                      hydrant_point, extra_attributes)
             else:
                 # This is a correspondence! Between multiple datasets!
                 # Hooray! Also PANIIIIIIIC!!!!!
                 # First, assemble attributes. Just hope the slicing works
                 sorted_nodes = sorted(component)
-                max_distance = self.get_max_distance_for_component(
+                max_distance = self._get_max_distance_for_component(
                         hydrant_graph, component)
 
                 source_datasets, source_indices = list(zip(*sorted_nodes))
@@ -465,10 +491,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                 geom_points = []
                 # proposed_geom will be type (priority, QgsPoint)
                 proposed_geom = (float('inf'), QgsPoint(0, 0))
-                name_feature_tuples = []
                 for dataset_name, hydrant_index in sorted_nodes:
-                    dataset = sources_dict[dataset_name]
-                    hydrant = list(dataset.getFeatures())[hydrant_index]
                     current_point = self.hydrant_geometries[dataset_name][hydrant_index]
                     geom_points.append(current_point)
                     # update proposed_geom if this point is higher priority
@@ -477,9 +500,11 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                     if current_priority < old_priority:
                         proposed_geom = (current_priority, current_point)
 
-                    name_feature_tuples.append((dataset_name, hydrant))
-
-                extra_attributes = self.get_extra_attributes(
+                name_feature_tuples = [
+                        (dataset_name,
+                         list(sources_dict[dataset_name].getFeatures())[index])
+                        for dataset_name, index in sorted_nodes]
+                extra_attributes = self._get_extra_attributes(
                         name_feature_tuples, index_range_dict)
 
                 # Now let's generate geometry. For now, just a line
@@ -489,14 +514,15 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                 geom_points.append(geom_points[0])
                 match_geometry = QgsGeometry.fromPolyline(geom_points)
 
-                self.add_to_correspondence(
+                # Add to appropriate sinks
+                self._add_to_correspondence(
                     ", ".join(source_datasets),
                     ", ".join([str(index) for index in source_indices]),
                     max_distance, match_geometry, extra_attributes
                     )
 
                 _, proposed_point = proposed_geom
-                self.add_to_proposed(
+                self._add_to_proposed(
                     ", ".join(source_datasets),
                     ", ".join([str(index) for index in source_indices]),
                     max_distance, proposed_point, extra_attributes
@@ -504,7 +530,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             # Update progress bar
             feedback.setProgress(int(counter * total))
 
-    def configure_sinks(self, merged_fields, parameters, context):
+    def _configure_sinks(self, merged_fields, parameters, context):
         """Configure our data sinks
 
         Input:
@@ -536,7 +562,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
 
         # Create sink object
         (self.correspondence_sink,
-         self.correspondence_dest_id) = self.parameterAsSink(
+         correspondence_dest_id) = self.parameterAsSink(
                 parameters,
                 self.CORRESPONDENCE,
                 context,
@@ -548,7 +574,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                                                                self.CORRESPONDENCE))
 
         (self.distinct_sink,
-         self.distinct_dest_id) = self.parameterAsSink(
+         distinct_dest_id) = self.parameterAsSink(
                 parameters,
                 self.DISTINCT,
                 context,
@@ -560,7 +586,7 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
                                                                self.DISTINCT))
 
         (self.proposed_sink,
-         self.proposed_dest_id) = self.parameterAsSink(
+         proposed_dest_id) = self.parameterAsSink(
                 parameters,
                 self.PROPOSED,
                 context,
@@ -571,6 +597,11 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.invalidSinkError(parameters,
                                                                self.PROPOSED))
 
+        dest_ids = {self.CORRESPONDENCE: correspondence_dest_id,
+                    self.DISTINCT: distinct_dest_id,
+                    self.PROPOSED: proposed_dest_id}
+
+        return dest_ids
 
     def processAlgorithm(self, parameters, context, feedback):  # pylint: disable=invalid-name
         """
@@ -586,23 +617,35 @@ class ReconcileHydrantsMultiProcessingAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                     self.invalidSourceError(parameters, self.HYDRANTS)
                     )
-        feedback.pushInfo(f"hydrant sources {hydrant_sources}")
         if len(hydrant_sources) < 2:
             raise QgsProcessingException(
                     "Invalid number of hydrant layers – got "
                     f"{len(hydrant_sources)} but expected 2+")
 
+        # confirmed_negative_sources = self.parameterAsLayerList(
+        #         parameters, self.CONFIRMED_NEGATIVES, context)
+        # if confirmed_negative_sources is None:
+        #     raise QgsProcessingException(
+        #             self.invalidSourceError(parameters,
+        #                                     self.CONFIRMED_NEGATIVES))
+        # confirmed_negative_source_names = [
+        #         source.name()
+        #         for source in confirmed_negative_sources]
+
         # Okay, prepare our data sinks
-        merged_fields, index_range_dict = self.generate_merged_fields(
+        merged_fields, index_range_dict = self._generate_merged_fields(
                 hydrant_sources)
-        self.configure_sinks(merged_fields, parameters, context)
+        dest_ids = self._configure_sinks(merged_fields, parameters, context)
+
+        # Transform geometries to one CRS
+        # all_hydrant_sources = hydrant_sources + confirmed_negative_sources
+        self._populate_geometries(hydrant_sources)
 
         # Construct hydrant graph!
-        hydrant_graph = self.generate_hydrant_graph(hydrant_sources, feedback)
+        hydrant_graph = self._generate_hydrant_graph(hydrant_sources, feedback)
 
         # Populate sinks based on graph
-        self.populate_sinks(hydrant_sources, hydrant_graph,
-                            index_range_dict, feedback)
-        return {self.CORRESPONDENCE: self.correspondence_dest_id,
-                self.DISTINCT: self.distinct_dest_id,
-                self.PROPOSED: self.proposed_dest_id}
+        self._populate_sinks(hydrant_sources, hydrant_graph,
+                             index_range_dict, feedback)
+
+        return dest_ids
