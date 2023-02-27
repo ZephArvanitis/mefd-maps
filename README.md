@@ -10,6 +10,38 @@ Processing scripts in this repo fall into a number of categories:
 ### Address table generation
 A key part of our map book is the ability to quickly look up any address and find what grid tile it's present in. This processing algorithm generates that table and outputs it.
 
+Some notes on it:
+
+- It has an obscene number of inputs, sorry! Each of them is important in
+    some way though.
+- It is *very important* that all the inputs cover all the area you're
+    interested in – one step of the algorithm involves intersecting with
+    the grid, the districts, and the "shelter bay" layer. Now you might be
+    thinking "Zeph, I know for a fact that Shelter Bay doesn't cover all of
+    Fidalgo Island". And you'd be right! ⭐ The shelter bay layer is a
+    polygon layer like any other, with a polygon depicting Shelter Bay
+    having a non-null value in a field (you'll chooose the field when you
+    configure the script for its run), and, importantly, a polygon covering
+    the area of interest (e.g. Fidalgo Island only).
+    - what this means is that the Shelter Bay layer serves two purposes:
+        one is to designate streets as within Shelter Bay (relevant because
+        navigation there is famously difficult), and the other is to limit
+        the address points and streets that will be shown. For instance, it
+        can be used to eliminate address points and roads in La Conner from the
+        address table.
+    - I know this is kind of gross, but in my opinion it was less gross
+        than adding yet ANOTHER input layer. Sorry future self.
+
+Features of this table:
+
+- lists district(s) in which addresses fall or through which roads travel
+- calls out when all addresses for a street are in a single tile + district
+- highlights when only odd/even addresses appear in a grid tile
+- includes roads with no addresses (useful if you need to navigate there
+    even though there's not an address on the street)
+- corrects for minor differences in street name between the address +
+    street layers, like FIRST to 1ST, MARYS to MARY'S, and so on.
+
 
 ### Hydrant reconciliation
 `reconcile_hydrants_multi` takes multiple hydrant datasets and does its best to wrangle them into one final dataset.
