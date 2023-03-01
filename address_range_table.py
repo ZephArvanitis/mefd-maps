@@ -33,6 +33,90 @@ from qgis.core import (  # pylint: disable=import-error
 from qgis import processing  # pylint: disable=import-error
 
 
+class AddressInfo:
+    """Container for info on addresses within a tile and sharing a street
+    """
+
+    def __init__(self):
+        self.addresses = set()
+        self.notes = []
+        self.districts = set()
+        self.custom_region = None
+        self.supplementary_info = set()
+
+    def __str__(self):
+        return (f"AddressInfo({self.addresses}, {self.notes}, "
+                f"{self.districts}, {self.custom_region}, "
+                f"{self.supplementary_info})")
+
+    def add_address(self, new_address):
+        """Add address to container
+        """
+        self.addresses |= {new_address}
+
+    def add_district(self, new_district):
+        """Add district to container
+        """
+        self.districts |= {new_district}
+
+    def add_supplementary_info(self, new_info):
+        """Add extra info like "see Pioneer Trails supplementary map"
+        """
+        self.supplementary_info |= {new_info}
+
+    def generate_simple_notes(self):
+        """Generate EVEN/ODD ONLY and NO ADDRESSES notes
+        """
+        if len(self.addresses) == 0:
+            self.notes = ["NO ADDRESSES"]
+        else:
+            # generate notes
+            self.notes = []
+            addresses_even = {address for address in self.addresses
+                              if address % 2 == 0}
+            addresses_odd = {address for address in self.addresses
+                             if address % 2 == 1}
+            n_even = len(addresses_even)
+            n_odd = len(addresses_odd)
+            if n_even == 0 and n_odd > 1:
+                self.notes.append("ODD ONLY")
+            if n_odd == 0 and n_even > 1:
+                self.notes.append("EVEN ONLY")
+
+    @property
+    def notes_string(self):
+        """Concatenate notes for the table
+        """
+        return ", ".join(self.notes)
+
+    @property
+    def districts_string(self):
+        """Concatenate districts for the table
+        """
+        # Override district with supplementary info (e.g. "SHELTER BAY"
+        # overrides "13")
+        if self.supplementary_info:
+            return " ".join(self.supplementary_info)
+
+        return ", ".join(self.districts)
+
+    @property
+    def min(self):
+        """Return minimum address
+        """
+        if self.addresses:
+            return min(self.addresses)
+        return None
+
+    @property
+    def max(self):
+        """Return max address
+        """
+        if self.addresses:
+            return max(self.addresses)
+        return None
+
+
 class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
     """
     This takes a grid (polygon layer) and addresses (points layer for now)
@@ -203,12 +287,6 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 [QgsProcessing.TypeVectorPolygon]
             )
         )
-        self.addParameter(
-            QgsProcessingParameterField(
-                self.SHELTER_BAY_FIELD,
-                'Field specifying shelter-bay-ness',
-                '',
-                self.SHELTER_BAY))
         self.addParameter(
             QgsProcessingParameterField(
                 self.SHELTER_BAY_FIELD,
@@ -537,6 +615,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                  if address_with_grid_layer.featureCount() else 0)
         feedback.pushInfo(f"Processing {address_with_grid_layer.featureCount()} "
                           "address points")
+
         address_with_grid_features = address_with_grid_layer.getFeatures()
 
         # Initialize expression context
@@ -545,35 +624,19 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             QgsExpressionContextUtils.globalProjectLayerScopes(
                 address_with_grid_layer))
 
-        # We're going to iterate over attributes and add 'em to dicts of
+        # We're going to iterate over attributes and add 'em to a dict of
         # form:
-        # number_grid_dict: {(street_name, grid_tile): {set of street numbers}}
-        # shelter_bay_dict: {(street_name, grid_tile): boolean}
-        # districts_dict: {(street_name, grid_tile): {set of districts}}
-        # The benefit to keeping these three separate is that we can make
-        # each a defaultdict
-        number_grid_dict = defaultdict(set)
-        districts_dict = defaultdict(set)
-        shelter_bay_dict = defaultdict(bool)
-
+        # {(street_name, grid_tile): AddressInfo}
+        address_info_dict = defaultdict(AddressInfo)
         for i, feature in enumerate(address_with_grid_features):
             if feedback.isCanceled():
                 break
 
-            # Configure field names for index access to attributes
             feature.setFields(address_with_grid_layer.fields(), False)
             map_id = feature[fields["map_id"]]
-            if "street_number" in fields:
-                address_number = feature[fields["street_number"]]
-            district = feature[fields["district"]]
-
             # Set context and evaluate street name expression
             expression_context.setFeature(feature)
             street_name = fields["street_name_expression"].evaluate(expression_context)
-            # feedback.pushInfo(f'working on feature {feature}, {feature.attributes()}')
-            # feedback.pushInfo(f'fields {[field.name() for field in address_with_grid_layer.fields()]}')
-            # feedback.pushInfo(f'map id {map_id}')
-            # feedback.pushInfo(f'just computed street name {street_name}')
 
             # skip streets outside the grid tiles
             if map_id is None:
@@ -582,29 +645,30 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             # Make street names match across streets vs address points
             if apply_map:
                 new_street_name = self.apply_mapping(street_name,
-                                                 feedback)
+                                                     feedback)
                 if new_street_name != street_name:
-                    feedback.pushInfo(f"street name {street_name} appears to have been updated to {new_street_name}")
+                    feedback.pushInfo(f"street name {street_name} updated to {new_street_name}")
                     street_name = new_street_name
 
             index_tuple = (street_name, map_id)
 
-            # add current address to address set
+            # Address
             if "street_number" in fields:
-                number_grid_dict[index_tuple] |= {address_number}
-            else:
-                number_grid_dict[index_tuple] = {}
+                address_info_dict[index_tuple].add_address(
+                        feature[fields["street_number"]])
 
+            # District
+            district = feature[fields["district"]]
             if district:
-                districts_dict[index_tuple] |= {district}
-            if feature[fields["shelter_bay"]]:
-                shelter_bay_dict[index_tuple] = True
+                address_info_dict[index_tuple].add_district(district)
+            # Supplementary info
+            supplementary_info = feature[fields["shelter_bay"]]
+            if supplementary_info:
+                address_info_dict[index_tuple].add_supplementary_info(supplementary_info)
 
             feedback.setProgress(int(i * total))
 
-        return {"numbers": number_grid_dict,
-                "shelter_bay": shelter_bay_dict,
-                "districts": districts_dict}
+        return address_info_dict
 
     def processAlgorithm(self, parameters, context, feedback):  # pylint: disable=invalid-name
         """
@@ -649,38 +713,24 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                                                      parameters, context,
                                                      feedback)
 
-        address_point_dicts = self.digest_address_points(
+        address_info_dict = self.digest_address_points(
                 address_with_grid_layer,
                 {"map_id": name_field,
                  "street_number": street_number_field,
                  "shelter_bay": shelter_bay_field,
                  "district": district_field,
                  "street_name_expression": address_street_name_expression}, feedback)
-        number_grid_dict = address_point_dicts["numbers"]
-        shelter_bay_dict = address_point_dicts["shelter_bay"]
-        districts_dict = address_point_dicts["districts"]
 
-        street_dicts = self.digest_address_points(
+        street_info_dict = self.digest_address_points(
                 street_with_grid_layer,
                 {"map_id": name_field,
                  "shelter_bay": shelter_bay_field,
                  "district": district_field,
                  "street_name_expression": street_name_expression},
                 feedback, apply_map=True)
-        streets_number_grid_dict = street_dicts["numbers"]
-        streets_shelter_bay_dict = street_dicts["shelter_bay"]
-        streets_districts_dict = street_dicts["districts"]
 
-        # feedback.pushInfo(f"resulting address dict {number_grid_dict}")
-        # feedback.pushInfo(f"resulting districts dict {districts_dict}")
-        # feedback.pushInfo(f"resulting shelter bay dict {shelter_bay_dict}")
-        # feedback.pushInfo(f"resulting address dict {streets_number_grid_dict}")
-        # feedback.pushInfo(f"resulting districts dict {streets_districts_dict}")
-        # feedback.pushInfo(f"resulting shelter bay dict {streets_shelter_bay_dict}")
-        address_streets = {street for street, _ in
-                           number_grid_dict.keys()}
-        street_streets = {street for street, _ in
-                           streets_number_grid_dict.keys()}
+        address_streets = {street for street, _ in address_info_dict.keys()}
+        street_streets = {street for street, _ in street_info_dict.keys()}
         feedback.pushInfo(f"address produces {len(address_streets)} streets")
         feedback.pushInfo(f"streets produce {len(street_streets)} streets")
         feedback.pushInfo(f"present in address but not streets: {address_streets - street_streets}")
@@ -696,62 +746,32 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         # {('a', 'r6a'): {3, 4, 5}, ('a', 'r4a'): {}, ('a', 'r5a'): {1, 2}}
         # Basically the second arg is the one whose values will "override"
         # those of the first
-        number_grid_dict = streets_number_grid_dict | number_grid_dict
-        shelter_bay_dict = streets_shelter_bay_dict | shelter_bay_dict
-        districts_dict = streets_districts_dict | districts_dict
+        address_info_dict = street_info_dict | address_info_dict
 
-        for (street_name, map_id), address_number_set in number_grid_dict.items():
+        for (street_name, map_id), address_info in address_info_dict.items():
             if street_name in self.address_to_street_name_map:
                 table_street_name = self.address_to_street_name_map[street_name]
             else:
                 table_street_name = street_name
-            # Order of attributes matters! Make sure this matches order
-            # defined above
-            # fields.append(QgsField("Street name", QVariant.String))
-            # fields.append(QgsField("District(s)", QVariant.String))
-            # fields.append(QgsField("Start address", QVariant.String))
-            # fields.append(QgsField("End address", QVariant.String))
-            # fields.append(QgsField("Map page", QVariant.String))
-            if len(address_number_set) == 0:
-                notes = ["NO ADDRESSES"]
-                address_min = None
-                address_max = None
-            else:
-                address_min = min(address_number_set)
-                address_max = max(address_number_set)
-
-                # generate notes
-                notes = []
-                addresses_even = {address for address in address_number_set
-                                  if address % 2 == 0}
-                addresses_odd = {address for address in address_number_set
-                                 if address % 2 == 1}
-                n_even = len(addresses_even)
-                n_odd = len(addresses_odd)
-                if n_even == 0 and n_odd > 0:
-                    notes.append("ODD ONLY")
-                if n_odd == 0 and n_even > 0:
-                    notes.append("EVEN ONLY")
-                all_grids_for_street = [grid_tile
-                                        for street, grid_tile in number_grid_dict.keys()
-                                        if street == street_name]
+            # Generate notes. In particular the ALL ADDRESSES entry
+            # requires a global check of other grid tiles, so it has to
+            # live here instead of AddressInfo
+            address_info.generate_simple_notes()
+            if len(address_info.addresses) > 0:
+                all_grids_for_street = [
+                        grid_tile
+                        for street, grid_tile in address_info_dict.keys()
+                        if street == street_name]
                 if len(all_grids_for_street) == 1:
                     # intentionally override even/odd only, since all addresses
                     # is strictly more informative
-                    notes = ["ALL ADDRESSES"]
+                    address_info.notes = ["ALL ADDRESSES"]
 
-            notes_str = ", ".join(notes)
-
-            # districts
-            districts = districts_dict[(street_name, map_id)]
-            districts = ", ".join(districts_dict[(street_name, map_id)])
-            # shelter bay overrides districts
-            if shelter_bay_dict[(street_name, map_id)]:
-                districts = "SHELTER BAY"
-
-            attributes = [table_street_name, districts,
-                          address_min, address_max,
-                          notes_str, map_id]
+            # Order of attributes matters! Make sure this matches order
+            # defined above
+            attributes = [table_street_name, address_info.districts_string,
+                          address_info.min, address_info.max,
+                          address_info.notes_string, map_id]
             feature = QgsFeature(self.output_fields)
             feature.setAttributes(attributes)
             self.sink.addFeature(feature, QgsFeatureSink.FastInsert)
