@@ -10,6 +10,7 @@
 *                                                                         *
 ***************************************************************************
 """
+import functools
 import re
 from collections import defaultdict
 
@@ -670,6 +671,51 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
 
         return address_info_dict
 
+    def order_address_table(self, address_info_dict):
+        """Apply our funky custom ordering and return a list of tuples like
+        [((street, mapid), AddressInfo), ...]
+
+        1. Street name (sort numbered streets by number rather than
+            alphabetically)
+        2. Start address
+        3. Map page
+        """
+        items = address_info_dict.items()
+        def custom_compare(item1, item2):
+            (street1, grid1), info1 = item1
+            (street2, grid2), info2 = item2
+
+            # Last, if start address and street name match, use map page to
+            # decide order
+            if street1 == street2 and info1.min == info2.min:
+                return -1 if grid1 < grid2 else (1 if grid1 > grid2 else 0)
+
+            # Second from last: if street address matches, sort based on
+            # min address number
+            if street1 == street2:
+                min1 = info1.min
+                min2 = info2.min
+                # Handle nones
+                if min1 is None:
+                    min1 = 100000000  # effectively infinity, sort later
+                if min2 is None:
+                    min2 = 100000000  # ditto
+                return -1 if min1 < min2 else (1 if min1 > min2 else 0)
+
+            # Finally, let's sort based on street number
+            number_match1 = re.match(r"\d+", street1)
+            number_match2 = re.match(r"\d+", street2)
+            # If both are numbered streets, return based on the street
+            # *values*
+            if number_match1 is not None and number_match2 is not None:
+                street_number1 = int(number_match1.group())
+                street_number2 = int(number_match2.group())
+                return street_number1 - street_number2
+            # If zero or one of these is a number, use string comparison
+            return -1 if street1 < street2 else (1 if street1 > street2 else 0)
+
+        return sorted(items, key=functools.cmp_to_key(custom_compare))
+
     def processAlgorithm(self, parameters, context, feedback):  # pylint: disable=invalid-name
         """
         Here is where the processing itself takes place.
@@ -692,7 +738,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         _, district_field = self._get_district_inputs(
                 parameters, context)
 
-        street_source, street_name_expression = self._get_street_inputs(
+        _, street_name_expression = self._get_street_inputs(
                 parameters, context)
 
         dest_ids = self._configure_sink(parameters, context, address_source.sourceCrs())
@@ -702,8 +748,6 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         address_crs = address_source.sourceCrs().authid()
         feedback.pushInfo(
             f'Grid CRS is {grid_crs}, Address CRS is {address_crs}')
-
-        feedback.pushInfo(f"source {address_source}, param {parameters[self.ADDRESS]}, name {address_source.sourceName()}")
 
         address_with_grid_layer = self._perform_joins(parameters[self.ADDRESS],
                                                       parameters, context,
@@ -748,7 +792,9 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         # those of the first
         address_info_dict = street_info_dict | address_info_dict
 
-        for (street_name, map_id), address_info in address_info_dict.items():
+        address_info = self.order_address_table(address_info_dict)
+
+        for (street_name, map_id), address_info in address_info:
             if street_name in self.address_to_street_name_map:
                 table_street_name = self.address_to_street_name_map[street_name]
             else:
