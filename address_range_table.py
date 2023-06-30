@@ -44,11 +44,12 @@ class AddressInfo:
         self.districts = set()
         self.custom_region = None
         self.supplementary_info = set()
+        self.extra_maps = set()
 
     def __str__(self):
         return (f"AddressInfo({self.addresses}, {self.notes}, "
                 f"{self.districts}, {self.custom_region}, "
-                f"{self.supplementary_info})")
+                f"{self.supplementary_info}, {self.extra_maps})")
 
     def add_address(self, new_address):
         """Add address to container
@@ -61,9 +62,14 @@ class AddressInfo:
         self.districts |= {new_district}
 
     def add_supplementary_info(self, new_info):
-        """Add extra info like "see Pioneer Trails supplementary map"
+        """Add district override based on e.g. shelter bay layer
         """
         self.supplementary_info |= {new_info}
+
+    def add_extra_map(self, extra_map_name):
+        """Add extra info like "see Pioneer Trails supplementary map"
+        """
+        self.extra_maps |= {extra_map_name}
 
     def generate_simple_notes(self):
         """Generate EVEN/ODD ONLY and NO ADDRESSES notes
@@ -141,6 +147,9 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
 
     SHELTER_BAY = "SHELTER_BAY"
     SHELTER_BAY_FIELD = "shelter_bay_field"
+
+    EXTRA_MAP = "EXTRA_MAP"
+    EXTRA_MAP_NAME = "extra_map_name"
 
     DISTRICTS = "DISTRICTS"
     DISTRICT_NAME_FIELD = "district_name_field"
@@ -295,6 +304,21 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 '',
                 self.SHELTER_BAY))
 
+        # Supplementary map layer
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.EXTRA_MAP,
+                self.tr('Boundaries for supplementary maps'),
+                [QgsProcessing.TypeVectorPolygon]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.EXTRA_MAP_NAME,
+                'Name of supplementary maps',
+                '',
+                self.EXTRA_MAP))
+
         # Streets (needed for NO STRUCTURES rows in table)
         self.addParameter(
             QgsProcessingParameterFeatureSource(
@@ -386,6 +410,26 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
 
 
         return shelter_bay_source, name_field
+
+    def _get_supplementary_maps(self, parameters, context):
+        """Get supplementary maps
+        """
+        supplementary_map_layer = self.parameterAsSource(
+            parameters,
+            self.EXTRA_MAP,
+            context
+        )
+        if supplementary_map_layer is None:
+            raise QgsProcessingException(
+                self.invalidSourceError(parameters, self.SHELTER_BAY)
+            )
+
+        name_field = self.parameterAsString(
+            parameters,
+            self.EXTRA_MAP_NAME,
+            context)
+
+        return supplementary_map_layer, name_field
 
     def _get_district_inputs(self, parameters, context):
         """Get district-related inputs
@@ -528,12 +572,15 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         - a layer of the starting layer, joined with shelter bay,
           districts, and grid
 
-        We're going to do three spatial joins:
+        We're going to do several spatial joins:
         1. address layer -> shelter bay boundary layer
            - will add the `shelterbay` attribute – 1 if it's in shelter bay, NULL otherwise.
-        2. address layer -> district boundaries
+        2. address layer -> supplementary map layer
+           - will add a boolean saying whether there's a relevant
+             supplementary map
+        3. address layer -> district boundaries
            - will add district_f attribute like 'MEFD' or '13'
-        3. address layer -> grid cells
+        4. address layer -> grid cells
            - will add a whole bunch of attributes, but we only care about the
              grid ID one, which the user will choose from a dropdown.
         """
@@ -542,12 +589,17 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                  starting_layer, parameters[self.SHELTER_BAY],
                  context, feedback)
 
-        # Spatial join #2: address layer -> district boundaries
-        address_with_district_layer = self._intersection_join(
+        # Spatial join #2: address layer -> supplementary map layer
+        address_with_supplement_layer = self._intersection_join(
                 address_with_shelter_bay_layer,
+                parameters[self.EXTRA_MAP], context, feedback)
+
+        # Spatial join #3: address layer -> district boundaries
+        address_with_district_layer = self._intersection_join(
+                address_with_supplement_layer,
                 parameters[self.DISTRICTS], context, feedback)
 
-        # Spatial join #3: address layer -> grid cells
+        # Spatial join #4: address layer -> grid cells
         address_with_grid_layer = self._intersection_join(
                  address_with_district_layer, parameters[self.GRID],
                  context, feedback)
@@ -592,7 +644,8 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         - address_with_grid_features: joined address layer, which should
           have fields from shelter bay, districts, and grid
         - fields: dict mapping "map_id", "street_number", "shelter_bay",
-          and "district" to the field names for each entry.
+          "extra_map_name", and "district" to the field names for each
+          entry.
         - expression_context: context for evaluating full street names from
           fields on the address table.
         - feedback: for providing progress/updates to the user
@@ -602,12 +655,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
           points)
 
         Returns a dict of dicts. Each dict is of form {(street_name,
-        grid_tile): something}, where something is given by:
-        - {"numbers": set of address numbers,
-           "shelter_bay": True/False for whether addresses on the
-           street/tile combo are in shelter bay,
-           "districts": set of districts for the street/tile combo
-          }
+        grid_tile): AddressInfo}
 
         """
         # Compute the number of steps to display within the progress bar and
@@ -666,6 +714,12 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             supplementary_info = feature[fields["shelter_bay"]]
             if supplementary_info:
                 address_info_dict[index_tuple].add_supplementary_info(supplementary_info)
+
+            # Supplementary map stuff
+            extra_map_name = feature[fields["extra_map_name"]]
+            if extra_map_name:
+                address_info_dict[index_tuple].add_extra_map(extra_map_name)
+                feedback.pushInfo(f"Address info has extra map named: {extra_map_name}")
 
             feedback.setProgress(int(i * total))
 
@@ -735,6 +789,9 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         _, shelter_bay_field = self._get_shelter_bay(
                 parameters, context)
 
+        _, extra_map_name_field = self._get_supplementary_maps(
+                parameters, context)
+
         _, district_field = self._get_district_inputs(
                 parameters, context)
 
@@ -746,6 +803,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         # Send some information to the user
         grid_crs = grid_source.sourceCrs().authid()
         address_crs = address_source.sourceCrs().authid()
+        feedback.pushInfo(f"LOOK IT UPDATED")
         feedback.pushInfo(
             f'Grid CRS is {grid_crs}, Address CRS is {address_crs}')
 
@@ -762,6 +820,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 {"map_id": name_field,
                  "street_number": street_number_field,
                  "shelter_bay": shelter_bay_field,
+                 "extra_map_name": extra_map_name_field,
                  "district": district_field,
                  "street_name_expression": address_street_name_expression}, feedback)
 
@@ -769,6 +828,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 street_with_grid_layer,
                 {"map_id": name_field,
                  "shelter_bay": shelter_bay_field,
+                 "extra_map_name": extra_map_name_field,
                  "district": district_field,
                  "street_name_expression": street_name_expression},
                 feedback, apply_map=True)
@@ -799,6 +859,11 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 table_street_name = self.address_to_street_name_map[street_name]
             else:
                 table_street_name = street_name
+
+            if address_info.extra_maps:
+                feedback.pushInfo(f"Address info has extra map(s): {address_info}")
+                map_id += "*"
+
             # Generate notes. In particular the ALL ADDRESSES entry
             # requires a global check of other grid tiles, so it has to
             # live here instead of AddressInfo
