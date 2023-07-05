@@ -4,6 +4,15 @@ Scripts and such involved in the 2023 rework of MEFD's map book
 Unless otherwise noted, these are scripts meant to be run via the QGIS
 processing toolbox.
 
+Note: to make this usable in QGIS via the processing toolbox, you'll want
+to make a symbolic link from this repo to where scripts live. **That
+symlink must include an explicit path rather than a relative one**. For
+example:
+
+```
+ln -s ~/path/to/repo/myscript.py /Users/zeph/Library/Application\ Support/QGIS/QGIS3/profiles/default/processing/scripts
+```
+
 ## Processing scripts
 Processing scripts in this repo fall into a number of categories:
 
