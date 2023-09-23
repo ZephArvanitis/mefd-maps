@@ -10,9 +10,11 @@
 *                                                                         *
 ***************************************************************************
 """
-import functools
-import re
 from collections import defaultdict
+from typing import Dict, List, Optional, Set
+import numpy as np
+import random
+from scipy.spatial import ConvexHull
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant  # pylint: disable=import-error
 from qgis.core import (  # pylint: disable=import-error
@@ -27,95 +29,183 @@ from qgis.core import (  # pylint: disable=import-error
     QgsFeatureSink,
     QgsField,
     QgsFields,
+    QgsGeometry,
+    QgsMultiPoint,
+    QgsPointXY,
     QgsProcessingContext,
     QgsProcessingException,
+    QgsProcessingFeatureSourceDefinition,
     QgsProcessingAlgorithm,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterNumber,
+    QgsProject,
     QgsWkbTypes,
 )
 from qgis import processing  # pylint: disable=import-error
 
 
-class AddressInfo:
-    """Container for info on addresses within a tile and sharing a street"""
+class PointAddress:
+    """Contain just a point and a label for it"""
+    def __init__(self, point, label: str):
+        self.point = point
+        self.label = label
 
-    def __init__(self):
-        self.addresses = set()
-        self.notes = []
-        self.districts = set()
-        self.custom_region = None
-        self.supplementary_info = set()
-        self.extra_maps = set()
+    def __repr__(self):
+        return f"PointAddress({self.point}, {self.label})"
+
+
+class PolygonAddress:
+    """Contain a label within a polygon"""
+    def __init__(self, polygon, label: str, scope: Optional[str] = None):
+        self.polygon = polygon
+        self.label = label
+        self.scope = scope
+
+    def __repr__(self):
+        return f"PolygonAddress({self.polygon}, {self.label}, {self.scope})"
+
+
+class Address:
+    """Encapsulate a single address"""
+    def __init__(self, address_number: int, full_street: str, town: str):
+        self.address_number = address_number
+        self.full_street = full_street
+        self.town = town
+
+    def __eq__(self, other):
+        return (self.address_number == other.address_number and
+                self.full_street == other.full_street and
+                self.town == other.town)
+
+    def __repr__(self):
+        return (f"Address({self.address_number}, "
+                f"{self.full_street}, {self.town})")
 
     def __str__(self):
-        return (
-            f"AddressInfo({self.addresses}, {self.notes}, "
-            f"{self.districts}, {self.custom_region}, "
-            f"{self.supplementary_info}, {self.extra_maps})"
-        )
-
-    def add_address(self, new_address):
-        """Add address to container"""
-        self.addresses |= {new_address}
-
-    def add_district(self, new_district):
-        """Add district to container"""
-        self.districts |= {new_district}
-
-    def add_supplementary_info(self, new_info):
-        """Add district override based on e.g. shelter bay layer"""
-        self.supplementary_info |= {new_info}
-
-    def add_extra_map(self, extra_map_name):
-        """Add extra info like "see Pioneer Trails supplementary map" """
-        self.extra_maps |= {extra_map_name}
-
-    def generate_simple_notes(self):
-        """Generate EVEN/ODD ONLY and NO ADDRESSES notes"""
-        if len(self.addresses) == 0:
-            self.notes = ["NO ADDRESSES"]
-        else:
-            # generate notes
-            self.notes = []
-            addresses_even = {address for address in self.addresses if address % 2 == 0}
-            addresses_odd = {address for address in self.addresses if address % 2 == 1}
-            n_even = len(addresses_even)
-            n_odd = len(addresses_odd)
-            if n_even == 0 and n_odd > 1:
-                self.notes.append("ODD ONLY")
-            if n_odd == 0 and n_even > 1:
-                self.notes.append("EVEN ONLY")
+        return f"{self.address_number} {self.full_street}, {self.town}"
 
     @property
-    def notes_string(self):
-        """Concatenate notes for the table"""
-        return ", ".join(self.notes)
+    def street_address(self):
+        return f"{self.address_number} {self.full_street}"
+
+    def __hash__(self):
+        return hash(repr(self))
+
+
+class SkagitAddressPoint:
+    """Contain info from a single skagit address point"""
+    def __init__(self, point, address_number: int, full_street: str,
+                 town: str,
+                 building=None, unit=None,
+                 parcel_id: Optional[str]=None):
+        self.point = point
+        self.address_number = address_number
+        self.full_street = full_street
+        self.town = town
+        self.building = building
+        self.unit = unit
+        self.parcel_id = parcel_id
 
     @property
-    def districts_string(self):
-        """Concatenate districts for the table"""
-        # Override district with supplementary info (e.g. "SHELTER BAY"
-        # overrides "13")
-        if self.supplementary_info:
-            return " ".join(self.supplementary_info)
-
-        return ", ".join(self.districts)
+    def address(self) -> Address:
+        """Extract just address"""
+        return Address(self.address_number, self.full_street, self.town)
 
     @property
-    def min(self):
-        """Return minimum address"""
-        if self.addresses:
-            return min(self.addresses)
-        return None
+    def label(self) -> str:
+        """Desired label"""
+        if not self.building and not self.unit:
+            return f"{self.address_number}"
+        if not self.building:
+            return f"{self.address_number} {self.unit}"
+        if not self.unit:
+            return f"{self.address_number} {self.building}"
+        return f"{self.address_number} {self.building}-{self.unit}"
 
     @property
-    def max(self):
-        """Return max address"""
-        if self.addresses:
-            return max(self.addresses)
-        return None
+    def label_address_only(self) -> str:
+        """If you're labeling and want *only* the address"""
+        return f"{self.address_number}"
+
+    def __repr__(self):
+        return (f"SkagitAddressPoint({self.point}, {self.address_number}, "
+                f"{self.full_street}, {self.town}, {self.building}, "
+                f"{self.unit}, {self.parcel_id})")
+
+
+class Parcel:
+    """Describe a single parcel"""
+    parcel_type: float
+    width: float
+    area: float
+    global_id: str
+    addresses: List[SkagitAddressPoint]
+
+    def __init__(self, geometry, parcel_type: int, width: float,
+                 area: float, global_id: str,
+                 address_points: Optional[List[SkagitAddressPoint]] = None):
+        self.geometry = geometry
+        self.parcel_type = parcel_type
+        self.width = width
+        self.area = area
+        self.global_id = global_id
+        if address_points is None:
+            address_points = []
+        self.address_points = address_points
+
+    def __repr__(self):
+        return (f"Parcel({self.geometry}, {self.parcel_type}, "
+                f"{self.width}, {self.area}, {self.global_id}, "
+                f"{self.address_points})"
+               )
+
+    def __eq__(self, other):
+        return (self.geometry == other.geometry and
+                self.parcel_type == other.parcel_type and
+                self.width == other.width and
+                self.area == other.area and
+                self.global_id == other.global_id)
+
+    def __hash__(self):
+        # Omit affiliated addresses from hash
+        return hash(f"Parcel({self.geometry}, {self.parcel_type}, "
+                f"{self.width}, {self.area}, {self.global_id})")
+
+
+class OutputLayers:
+    """Hold the four output layers, in python objects"""
+    boring_addresses: List[PointAddress]
+    dense_address_polygons: List[PolygonAddress]
+    wrapper_polygons: List[PolygonAddress]
+    sub_address_points: List[PointAddress]
+
+    def __init__(self,
+                 boring_addresses: Optional[List[PointAddress]] = None,
+                 dense_address_polygons: Optional[List[PolygonAddress]] = None,
+                 wrapper_polygons: Optional[List[PolygonAddress]] = None,
+                 sub_address_points: Optional[List[PointAddress]] = None
+                 ):
+        if boring_addresses is None:
+            boring_addresses = []
+        if dense_address_polygons is None:
+            dense_address_polygons = []
+        if wrapper_polygons is None:
+            wrapper_polygons = []
+        if sub_address_points is None:
+            sub_address_points = []
+
+        self.boring_addresses = boring_addresses
+        self.dense_address_polygons = dense_address_polygons
+        self.wrapper_polygons = wrapper_polygons
+        self.sub_address_points = sub_address_points
+
+    def __str__(self):
+        return("OutputLayers with "
+               f"{len(self.boring_addresses)} boring addresses, "
+               f"{len(self.dense_address_polygons)} dense address polygons, "
+               f"{len(self.wrapper_polygons)} wrapper polygons, and "
+               f"{len(self.sub_address_points)} sub address points.")
 
 
 class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
@@ -148,6 +238,7 @@ class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
     ADDRESS_STREET_FIELD = "address_street_field"
     ADDRESS_BUILDING_FIELD = "address_building_field"
     ADDRESS_UNIT_FIELD = "address_unit_field"
+    ADDRESS_TOWN_FIELD = "address_town_field"
 
     # Grid layer just for extent
     GRID = 'GRID'
@@ -157,23 +248,16 @@ class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
     WRAPPER_POLYGONS = "WRAPPER_POLYGONS"
     ADDRESS_SUB_POINTS = "ADDRESS_SUB_POINTS"
 
-    STREET_TO_ADDRESS_NAME_MAP = {
-        "FIRST": "1ST",
-        "SECOND": "2ND",
-        "THIRD": "3RD",
-        "FOURTH": "4TH",
-        "FIFTH": "5TH",
-        "SIXTH": "6TH",
-        "&": "AND",
-    }
-    REVERSE_NAME_MAP = {"É": "E", "-": " ", "'": "", r"\.": ""}
-
     def __init__(self):
         self.address_points_sink = None
         self.address_polygons_sink = None
         self.wrapper_polygons_sink = None
         self.address_sub_points_sink = None
         self.output_fields = None
+        self.parcel_type_value: float = None
+        self.parcel_dict: Dict[str, Parcel] = {}
+        self.address_dict: Dict[Address, List[SkagitAddressPoint]]
+        self.output_layers: OutputLayers = None
         super().__init__()
 
     def tr(self, string):  # pylint: disable=invalid-name
@@ -257,6 +341,11 @@ class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterExpression(
                 self.ADDRESS_STREET_FIELD, "Define full street name", "", self.ADDRESS
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.ADDRESS_TOWN_FIELD, "Choose town field", "", self.ADDRESS
             )
         )
         self.addParameter(
@@ -349,8 +438,12 @@ class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
         unit_field = self.parameterAsString(
             parameters, self.ADDRESS_UNIT_FIELD, context
         )
+        town_field = self.parameterAsString(
+            parameters, self.ADDRESS_TOWN_FIELD, context
+        )
         return (address_source, street_number_field,
-                street_name_expression, building_field, unit_field)
+                street_name_expression, building_field, unit_field,
+                town_field)
 
     def _get_parcel_inputs(self, parameters, context):
         """Get parcel-related inputs"""
@@ -434,272 +527,368 @@ class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
                 self.ADDRESS_SUB_POINTS: address_sub_points_dest_id,
                 }
 
-    def _intersection_join(self, input1, input2, context, feedback):
-        """Run a spatial join with two inputs, storing result in memory"""
-        feedback.pushInfo(
-            "About to try an intersection with "
-            f"{input1} (type {type(input1)}) x {input2}"
-        )
-        intersection_dict = {
-            "INPUT": input1,
-            "OVERLAY": input2,
-            "INPUT_FIELDS": [],
-            "OVERLAY_FIELDS": [],
-            "OVERLAY_FIELDS_PREFIX": "",
-            "OUTPUT": "TEMPORARY_OUTPUT",
-        }  # We'll store this in memory and steal it
-        # back from the context after the algorithm completes
-        # Method from https://gis.stackexchange.com/a/426338/161588
-        intersect_result = processing.run(
-            "native:intersection",
-            intersection_dict,
-            is_child_algorithm=True,
-            context=context,
-            feedback=feedback,
-        )["OUTPUT"]
-        intersect_layer = QgsProcessingContext.takeResultLayer(
-            context, intersect_result
-        )
+    def clip_layers(self, parameters, feedback):
+        """Clip address + parcel layers to grid"""
+        # Send some information to the user
+        feedback.pushInfo("Clipping inputs")
 
-        return intersect_layer
+        address_clip_layer = processing.run(
+            "native:clip",
+            {'INPUT':QgsProcessingFeatureSourceDefinition(
+                 parameters[self.ADDRESS],
+                 selectedFeaturesOnly=False,
+                 featureLimit=-1,
+                 flags=QgsProcessingFeatureSourceDefinition.FlagOverrideDefaultGeometryCheck,
+                 geometryCheck=QgsFeatureRequest.GeometrySkipInvalid),
+             'OVERLAY':parameters[self.GRID],
+             'OUTPUT':'TEMPORARY_OUTPUT'})["OUTPUT"]
 
-    def _perform_joins(self, starting_layer, parameters, context, feedback):
-        """Perform necessary joins
+        parcel_clip_layer = processing.run(
+            "native:clip",
+            {'INPUT':QgsProcessingFeatureSourceDefinition(
+                 parameters[self.PARCEL],
+                 selectedFeaturesOnly=False,
+                 featureLimit=-1,
+                 flags=QgsProcessingFeatureSourceDefinition.FlagOverrideDefaultGeometryCheck,
+                 geometryCheck=QgsFeatureRequest.GeometrySkipInvalid),
+             'OVERLAY':parameters[self.GRID],
+             'OUTPUT':'TEMPORARY_OUTPUT'})["OUTPUT"]
 
-        Inputs:
-        - starting layer: the address or streets layer to join against
-        - parameters: the processing algorithm parameters, from which the
-          method will retrieve shelter bay, districts, and grid cells
-        - context: the processing context, used for the actual joins
-        - feedback: the feedback for the user, useful for printing messages
-          or just to pass to the joins
+        return address_clip_layer, parcel_clip_layer
 
-        Returns:
-        - a layer of the starting layer, joined with shelter bay,
-          districts, and grid
+    def add_geom_fields(self, parcel_clip_layer, fields, feedback):
+        """Add area and width to parcel layer"""
+        feedback.pushInfo("Calculating area and width of parcels")
+        parcel_clip_layer_with_area = processing.run(
+            "native:refactorfields",
+            {'INPUT': parcel_clip_layer,
+             'FIELDS_MAPPING':[
+                 {'expression': f'"{fields["parcel_type"]}"','length': 18,
+                  'name': fields["parcel_type"],'precision': 8,
+                  'sub_type': 0,'type': 6,'type_name': 'double precision'},
+                 {'expression': f'"{fields["parcel_global_id"]}"','length': 38,
+                  'name': fields["parcel_global_id"],'precision': 0,
+                  'sub_type': 0,'type': 10,'type_name': 'text'},
+                 {'expression': 'bounds_width($geometry)','length': 0,
+                  'name': fields["width"],'precision': 0,
+                  'sub_type': 0,'type': 6,'type_name': 'double precision'},
+                 {'expression': '$area','length': 0,
+                  'name': fields["area"],'precision': 0,
+                  'sub_type': 0,'type': 6,'type_name': 'double precision'}],
+             'OUTPUT':'TEMPORARY_OUTPUT'})["OUTPUT"]
 
-        We're going to do several spatial joins:
-        1. address layer -> shelter bay boundary layer
-           - will add the `shelterbay` attribute – 1 if it's in shelter bay, NULL otherwise.
-        2. address layer -> supplementary map layer
-           - will add a boolean saying whether there's a relevant
-             supplementary map
-        3. address layer -> district boundaries
-           - will add district_f attribute like 'MEFD' or '13'
-        4. address layer -> grid cells
-           - will add a whole bunch of attributes, but we only care about the
-             grid ID one, which the user will choose from a dropdown.
+        return parcel_clip_layer_with_area
+
+    def get_parcels(self, parcel_layer, fields, feedback):
+        """Convert parcels to python objects, make dict from global id -> parcel"""
+        feedback.pushInfo("About to process parcel layer into python objects")
+        parcel_dict = {}
+        for feature in parcel_layer.getFeatures():
+            feature.setFields(parcel_layer.fields(), False)
+
+            geometry = feature.geometry()
+            parcel_type = feature[fields["parcel_type"]]
+            width = feature[fields["width"]]
+            area = feature[fields["area"]]
+            global_id = feature[fields["parcel_global_id"]]
+
+            parcel = Parcel(geometry, parcel_type, width, area, global_id)
+            assert global_id not in parcel_dict
+            parcel_dict[global_id] = parcel
+
+        return parcel_dict
+
+    def get_address_points(self, address_with_parcel_layer, fields,
+                           feedback):
+        """Process layer points into a list of python objects
+
+        Along the way, add address points to their parcels for
+        back-reference.
         """
-        # Spatial join #1: address layer -> shelter bay boundary
-        address_with_shelter_bay_layer = self._intersection_join(
-            starting_layer, parameters[self.SHELTER_BAY], context, feedback
-        )
-
-        # Spatial join #2: address layer -> supplementary map layer
-        address_with_supplement_layer = self._intersection_join(
-            address_with_shelter_bay_layer,
-            parameters[self.EXTRA_MAP],
-            context,
-            feedback,
-        )
-
-        # Spatial join #3: address layer -> district boundaries
-        address_with_district_layer = self._intersection_join(
-            address_with_supplement_layer, parameters[self.DISTRICTS], context, feedback
-        )
-
-        # Spatial join #4: address layer -> grid cells
-        address_with_grid_layer = self._intersection_join(
-            address_with_district_layer, parameters[self.GRID], context, feedback
-        )
-
-        return address_with_grid_layer
-
-    def _filter_with_grid(self, input_layer, parameters, context, feedback):
-        """Get only features that intersect a grid tile
-
-        We'll do this via a single spatial join.
-        """
-        # Spatial join: address layer -> grid
-        layer_with_grid = self._intersection_join(
-            input_layer, parameters[self.GRID], context, feedback
-        )
-
-        return layer_with_grid
-
-    def apply_mapping(self, street_name, feedback):
-        """Apply substitutions like FIRST -> 1ST in a street name
-
-        Also populates self.address_to_street_name_map as we go
-        """
-        updated_street_name = street_name
-        # First, do unambiguous substitutions
-        for key, update in self.STREET_TO_ADDRESS_NAME_MAP.items():
-            if re.search(key, updated_street_name) is not None:
-                feedback.pushInfo(
-                    f"Updating {key} -> {update} in {updated_street_name}"
-                )
-                updated_street_name = re.sub(key, update, updated_street_name)
-        # Now do substitutions to make street names match address point
-        # streets, but log those in a reverse dictionary for later
-        # correction
-        for key, update in self.REVERSE_NAME_MAP.items():
-            if re.search(key, updated_street_name) is not None:
-                feedback.pushInfo(
-                    f"Updating {key} -> {update} in {updated_street_name}"
-                )
-                new_street_name = re.sub(key, update, updated_street_name)
-                self.address_to_street_name_map[new_street_name] = updated_street_name
-                updated_street_name = new_street_name
-
-        if updated_street_name != street_name:
-            feedback.pushInfo(f"New street name {updated_street_name}")
-            feedback.pushInfo(f"Street name mapping {self.address_to_street_name_map}")
-        return updated_street_name
-
-    def digest_address_points(
-        self, address_with_grid_layer, fields, feedback, apply_map=False
-    ):
-        """Process joined address points into dictionaries
-
-        Inputs:
-        - address_with_grid_features: joined address layer, which should
-          have fields from shelter bay, districts, and grid
-        - fields: dict mapping "map_id", "street_number", "shelter_bay",
-          "extra_map_name", and "district" to the field names for each
-          entry.
-        - expression_context: context for evaluating full street names from
-          fields on the address table.
-        - feedback: for providing progress/updates to the user
-        - apply_map: whether to use STREET_TO_ADDRESS_NAME_MAP and
-          REVERSE_NAME_MAP when creating keys in the dictionaries. (Should
-          be True when running on streets, False when running on address
-          points)
-
-        Returns a dict of dicts. Each dict is of form {(street_name,
-        grid_tile): AddressInfo}
-
-        """
-        # Compute the number of steps to display within the progress bar and
-        # get features from source
-        total = (
-            100.0 / address_with_grid_layer.featureCount()
-            if address_with_grid_layer.featureCount()
-            else 0
-        )
-        feedback.pushInfo(
-            f"Processing {address_with_grid_layer.featureCount()} " "address points"
-        )
-
-        address_with_grid_features = address_with_grid_layer.getFeatures()
-
-        # Initialize expression context
         expression_context = QgsExpressionContext()
-        expression_context.appendScopes(
-            QgsExpressionContextUtils.globalProjectLayerScopes(address_with_grid_layer)
-        )
 
-        # We're going to iterate over attributes and add 'em to a dict of
-        # form:
-        # {(street_name, grid_tile): AddressInfo}
-        address_info_dict = defaultdict(AddressInfo)
-        for i, feature in enumerate(address_with_grid_features):
-            if feedback.isCanceled():
-                break
+        python_objects = []
+        feedback.pushInfo("About to process address points into python objects")
+        for feature in address_with_parcel_layer.getFeatures():
+            feature.setFields(address_with_parcel_layer.fields(), False)
+            address_number = feature[fields["street_number"]]
+            building = feature[fields["building"]]
+            unit = feature[fields["unit"]]
+            town = feature[fields["town"]]
+            parcel_id = feature[fields["parcel_global_id"]]
 
-            feature.setFields(address_with_grid_layer.fields(), False)
-            map_id = feature[fields["map_id"]]
-            # Set context and evaluate street name expression
+            # If unit or building is null, instead of showing up as None it
+            # registers as a PyQt5.QtCore.QVariant with a value() of NULL?
+            # Not sure why, but let's fix that now
+            if hasattr(building, "value") and str(building) == "NULL":
+                building = None
+            if hasattr(unit, "value") and str(unit) == "NULL":
+                unit = None
+
+            # street name via expression
             expression_context.setFeature(feature)
             street_name = fields["street_name_expression"].evaluate(expression_context)
 
-            # skip streets outside the grid tiles
-            if map_id is None:
+            # geometry
+            geometry = feature.geometry()
+
+            address_object = SkagitAddressPoint(geometry, address_number,
+                                                street_name, town,
+                                                building, unit, parcel_id)
+            python_objects.append(address_object)
+            if parcel_id is not None:
+                self.parcel_dict[parcel_id].address_points.append(address_object)
+
+        return python_objects
+
+    def make_address_dict(
+            self,
+            address_points: List[SkagitAddressPoint]) -> Dict[
+                    Address, Set[SkagitAddressPoint]]:
+        """Collect address points by base address"""
+        address_dict = defaultdict(set)
+        for address_point in address_points:
+            address_dict[address_point.address].add(address_point)
+
+        return dict(address_dict)
+
+    def add_as_point_or_parcel(self, geometry, label, parcel_id,
+                               use_full_address=True):
+        """Add a label as either a point or a parcel
+
+        returns True if parcel, False if point
+        """
+        if parcel_id is not None:
+            parcel = self.parcel_dict[parcel_id]
+            # TODO: don't hardcode these values
+            # Also maybe optimize them??
+            is_small = parcel.width < 200 or parcel.area < 2000
+            # Filter out road/water parcels
+            is_plot = parcel.parcel_type == self.parcel_type_value
+            if use_full_address:
+                only_address_in_parcel = len(parcel.address_points) == 1
+            else:
+                only_address_in_parcel = len(set(
+                    address_point.address
+                    for address_point in parcel.address_points)) == 1
+
+            if is_small and is_plot and only_address_in_parcel:
+                # Small parcel -> put label inside parcel
+                polygon = PolygonAddress(parcel.geometry,
+                                         label)
+                self.output_layers.dense_address_polygons.append(polygon)
+                return True
+        # If we reach here, we want to label on the point
+        point_address = PointAddress(geometry, label)
+        self.output_layers.boring_addresses.append(point_address)
+        return False
+
+    def get_output_layer_objects(self, address_points,
+                                 feedback):
+        """Actually do the algorithm. Dang it, now I have to figure that out"""
+        feedback.pushInfo("Starting to process addresses + parcels")
+
+        self.output_layers = OutputLayers()
+
+        # Gather address points by base address
+        self.address_dict = self.make_address_dict(address_points)
+
+        for address, points in self.address_dict.items():
+            # Just one point -> decide whether to label the point or the
+            # polygon based on denseness of the area (as a proxy, use width
+            # + area of parcel if it's the correct parcel type)
+            if len(points) == 1:
+                point = points.pop()
+                geometry = point.point
+                added_as_parcel = self.add_as_point_or_parcel(geometry, point.label,
+                                                              point.parcel_id)
+                continue
+                #     # TODO: don't hardcode these values
+                #     # Also maybe optimize them??
+                #     is_small = parcel.width < 200 or parcel.area < 2000
+                #     # Filter out road/water parcels
+                #     is_plot = parcel.parcel_type == self.parcel_type_value
+                #     only_address_in_parcel = len(parcel.address_points) == 1
+                #     if is_small and is_plot and only_address_in_parcel:
+                #         # Small parcel -> put label inside parcel
+                #         polygon = PolygonAddress(parcel.geometry,
+                #                                  point.label)
+                #         self.output_layers.dense_address_polygons.append(polygon)
+                #         continue
+                # # If we reach here, we have just one address point for the
+                # # address, and it's either a) not in a dense area or b) has
+                # # multiple address points in the same parcel -> put the address
+                # # label on the point
+                # # TODO: can we do anything smarter with multiple address
+                # # points in a single parcel?
+                # point_address = PointAddress(point.point, point.label)
+                # self.output_layers.boring_addresses.append(point_address)
+                # continue
+
+            # If we reach here, we have multiple points for this address,
+            # which usually means multiple buildings/units
+            n_points = len(points)
+            units = set(point.unit for point in points
+                        if point.unit is not None)
+            buildings = set(point.building for point in points
+                            if point.building is not None)
+            # One not-uncommon case (about 20% on Fidalgo Island) is where
+            # there are multiple points but they're not different
+            # units/buildings. This might mean there are points per room or
+            # floor, which we *really* don't care about for the mapbook
+            if len(units) == 0 and len(buildings) == 0:
+                # Use the weighted centroid of point locations. This is
+                # subtly different from the centroid, but much easier to
+                # calculate. And frankly if we have three points on one
+                # side and one on the other, it kind of makes sense for the
+                # actual label to be closer to the three points rather than
+                # at the true center
+                geom_points = [point.point.asMultiPoint() for point in points]
+                x_coords = [geom[0].x() for geom in geom_points]
+                y_coords = [geom[0].y() for geom in geom_points]
+                new_point_coords = (sum(x_coords) / len(x_coords),
+                                    sum(y_coords) / len(y_coords))
+                new_point = QgsPointXY(*new_point_coords)
+                point_geometry = QgsGeometry.fromPointXY(new_point)
+                # Since there are no units or buildings, all labels should match
+                label = points.pop().label
+                # point_address = PointAddress(point_geometry, label)
+                # output_layers.boring_addresses.append(point_address)
+                # continue
+                parcel_ids_for_points = [point.parcel_id
+                                         for point in points
+                                         if point.parcel_id is not None]
+                if len(set(parcel_ids_for_points)) == 1:
+                    parcel_id = parcel_ids_for_points[0]
+                    added_as_parcel = self.add_as_point_or_parcel(
+                            point_geometry, label, parcel_id,
+                            use_full_address=False)
+                    # feedback.pushInfo(f"multiple points matching address: Added {address} as {'parcel' if added_as_parcel else 'point'}")
+                    continue
+                # If we reach here, we label on the centroid
+                point_address = PointAddress(point_geometry, label)
+                self.output_layers.boring_addresses.append(point_address)
+                # feedback.pushInfo(f"multiple points matching address: put {address} at centroid point")
                 continue
 
-            # Make street names match across streets vs address points
-            if apply_map:
-                new_street_name = self.apply_mapping(street_name, feedback)
-                if new_street_name != street_name:
-                    feedback.pushInfo(
-                        f"street name {street_name} updated to {new_street_name}"
-                    )
-                    street_name = new_street_name
+            # Special case: there are two points with separate
+            # building/unit information. If they're really close together,
+            # just label midpoint with the address. If they're further
+            # apart, label each individually.
+            if len(points) == 2:
+                geom_points = [point.point.asMultiPoint() for point in points]
+                x_coords = [geom[0].x() for geom in geom_points]
+                y_coords = [geom[0].y() for geom in geom_points]
+                point1 = QgsPointXY(x_coords[0], y_coords[0])
+                distance = point1.distance(x_coords[1], y_coords[1])
+                # Get distance between the points (in crs units (grrr))
+                if distance < 200:  # idk, total guess
+                    # They're really close together: label midpoint
+                    new_point_coords = (sum(x_coords) / len(x_coords),
+                                        sum(y_coords) / len(y_coords))
+                    new_point = QgsPointXY(*new_point_coords)
+                    point_geometry = QgsGeometry.fromPointXY(new_point)
+                    label = random.choice(list(points)).label_address_only
 
-            index_tuple = (street_name, map_id)
+                    parcel_ids_for_points = [point.parcel_id
+                                             for point in points
+                                             if point.parcel_id is not None]
+                    if len(set(parcel_ids_for_points)) == 1:
+                        parcel_id = parcel_ids_for_points[0]
+                        added_as_parcel = self.add_as_point_or_parcel(
+                                point_geometry, label, parcel_id,
+                                use_full_address=False)
+                        # feedback.pushInfo(f"2 points within short distance: Added {address} as {'parcel' if added_as_parcel else 'point'}")
+                        continue
+                    # Multiple parcels: abdicate and label on centroid
+                    point_address = PointAddress(point_geometry, label)
+                    self.output_layers.boring_addresses.append(point_address)
+                    # feedback.pushInfo(f"2 points within short distance with multiple parcels: put {address} at centroid point")
+                    continue
 
-            # Address
-            if "street_number" in fields:
-                address_info_dict[index_tuple].add_address(
-                    feature[fields["street_number"]]
-                )
+                # Further apart: label both
+                for point in points:
+                    point_address = PointAddress(point.point, point.label)
+                    self.output_layers.boring_addresses.append(point_address)
+                # feedback.pushInfo(
+                #         f"Labeling {address} on individual parts"
+                #         f"distance {distance} is larger. Has "
+                #         f"{len(points)} points, inc "
+                #         f"{len(units)} units ({units}) and"
+                #         f"{len(buildings)} buildings ({buildings})")
+                continue
 
-            # District
-            district = feature[fields["district"]]
-            if district:
-                address_info_dict[index_tuple].add_district(district)
-            # Supplementary info
-            supplementary_info = feature[fields["shelter_bay"]]
-            if supplementary_info:
-                address_info_dict[index_tuple].add_supplementary_info(
-                    supplementary_info
-                )
 
-            # Supplementary map stuff
-            extra_map_name = feature[fields["extra_map_name"]]
-            if extra_map_name:
-                address_info_dict[index_tuple].add_extra_map(extra_map_name)
-                feedback.pushInfo(f"Address info has extra map named: {extra_map_name}")
+            # Now we know there are 3+ points and multiple
+            # buildings/units. In general we are going to:
+            # 1. Create a bounding geometry for the points.
+            # 2. Based on the size of that bounding geometry and total
+            #    number of points, decide whether to label just one point,
+            #    label all the points individually, or actually draw the
+            #    bounding hull and optionally label subpoints
 
-            feedback.setProgress(int(i * total))
+            # Create bounding hull
 
-        return address_info_dict
+            geom_points = [point.point.asMultiPoint() for point in points]
+            coords = np.array([[geom[0].x(), geom[0].y()]
+                               for geom in geom_points])
+            hull = ConvexHull(points=coords)
 
-    def order_address_table(self, address_info_dict):
-        """Apply our funky custom ordering and return a list of tuples like
-        [((street, mapid), AddressInfo), ...]
+            xspan, yspan = (np.max(hull.points, axis=0) -
+                            np.min(hull.points, axis=0))
 
-        1. Street name (sort numbered streets by number rather than
-            alphabetically)
-        2. Start address
-        3. Map page
-        """
-        items = address_info_dict.items()
+            feedback.pushInfo(f"Generated hull for {address} ({n_points}). It has area "
+                              f"{hull.area:.0f},  xspan {xspan:.0f}, yspan {yspan:.0f}")
+            # This is very much a first pass, I'm in a hurry to have a
+            # draft sort of logic. But based on a cursory glance...
+            if xspan >= 200 or yspan >= 200 or hull.area >= 500:
+                # Outline wrapper hull and label within it
+                geometry = QgsGeometry.fromPolygonXY(
+                        [[QgsPointXY(*pt) for pt in
+                          hull.points[hull.vertices]]])
+                # Label large polygons with full address, small with just
+                # the number
+                if hull.area > 900:
+                    label = address.street_address
+                else:
+                    label = address.address_number
+                wrapper_polygon = PolygonAddress(geometry, label,
+                                                 scope="address")
+                self.output_layers.wrapper_polygons.append(wrapper_polygon)
+                feedback.pushInfo(f"  Added as wrapper polygon woot {label}")
+                continue
 
-        def custom_compare(item1, item2):
-            (street1, grid1), info1 = item1
-            (street2, grid2), info2 = item2
+            # Merge the damn points and label on point/parcel like before
+            x_coords = [geom[0].x() for geom in geom_points]
+            y_coords = [geom[0].y() for geom in geom_points]
+            new_point_coords = (sum(x_coords) / len(x_coords),
+                                sum(y_coords) / len(y_coords))
+            new_point = QgsPointXY(*new_point_coords)
+            point_geometry = QgsGeometry.fromPointXY(new_point)
+            parcel_ids_for_points = [point.parcel_id
+                                     for point in points
+                                     if point.parcel_id is not None]
+            label = address.address_number
+            if len(set(parcel_ids_for_points)) == 1:
+                parcel_id = parcel_ids_for_points[0]
+                added_as_parcel = self.add_as_point_or_parcel(
+                        point_geometry, label, parcel_id,
+                        use_full_address=False)
+                feedback.pushInfo(f"  big-ass address thing: Added {address} as {'parcel' if added_as_parcel else 'point'}")
+                continue
+            # If we reach here, we label on the centroid
+            point_address = PointAddress(point_geometry, label)
+            self.output_layers.boring_addresses.append(point_address)
+            feedback.pushInfo(f"  big-ass address thing: Added {address} as point b/c more than one parcel")
+            continue
 
-            # Last, if start address and street name match, use map page to
-            # decide order
-            if street1 == street2 and info1.min == info2.min:
-                return -1 if grid1 < grid2 else (1 if grid1 > grid2 else 0)
 
-            # Second from last: if street address matches, sort based on
-            # min address number
-            if street1 == street2:
-                min1 = info1.min
-                min2 = info2.min
-                # Handle nones
-                if min1 is None:
-                    min1 = 100000000  # effectively infinity, sort later
-                if min2 is None:
-                    min2 = 100000000  # ditto
-                return -1 if min1 < min2 else (1 if min1 > min2 else 0)
+            # feedback.pushInfo(f"Skipping address {address} for now, as it has "
+            #                   f"{n_points} points, inc {len(units)} "
+            #                   f"units ({units}) and {len(buildings)} "
+            #                   f"buildings ({buildings})")
 
-            # Finally, let's sort based on street number
-            number_match1 = re.match(r"\d+", street1)
-            number_match2 = re.match(r"\d+", street2)
-            # If both are numbered streets, return based on the street
-            # *values*
-            if number_match1 is not None and number_match2 is not None:
-                street_number1 = int(number_match1.group())
-                street_number2 = int(number_match2.group())
-                return street_number1 - street_number2
-            # If zero or one of these is a number, use string comparison
-            return -1 if street1 < street2 else (1 if street1 > street2 else 0)
-
-        return sorted(items, key=functools.cmp_to_key(custom_compare))
+        return self.output_layers
 
     def processAlgorithm(
         self, parameters, context, feedback
@@ -707,164 +896,133 @@ class AddressLabelProcessingAlgorithm(QgsProcessingAlgorithm):
         """
         Here is where the processing itself takes place.
         """
-        # Retrieve the feature source and sink. The 'dest_id' variable is used
-        # to uniquely identify the feature sink, and must be included in the
-        # dictionary returned by the processAlgorithm function.
-        # Grid info
-        grid_source = self._get_grid_inputs(parameters, context)
-
         (
             address_source,
             street_number_field,
             address_street_name_expression,
             address_building_field,
-            address_unit_field
+            address_unit_field,
+            address_town_field
         ) = self._get_address_inputs(parameters, context)
 
         (
-            parcel_source,
+            _,
             parcel_type_field,
             parcel_type_value
         ) = self._get_parcel_inputs(parameters, context)
+        self.parcel_type_value = float(parcel_type_value)
+        # TODO: accept as input rather than hardcoding
+        global_id_field = "GlobalID"
 
         dest_ids = self._configure_sinks(parameters, context, address_source.sourceCrs())
 
-        # Send some information to the user
-        feedback.pushInfo("Working on processing inputs")
+        address_clip_layer, parcel_clip_layer = self.clip_layers(parameters, feedback)
 
-        # Filter to see only addresses and parcels we care about
-        # Addresses: join with grid
-        # filtered_address_layer = self._filter_with_grid(
-        #     parameters[self.ADDRESS],
-        #     parameters, context, feedback)
+        # Hard code these two fields
+        area_field = "area"
+        width_field = "width"
+        fields = {
+            "street_number": street_number_field,
+            "street_name_expression": address_street_name_expression,
+            "building": address_building_field,
+            "unit": address_unit_field,
+            "town": address_town_field,
+            "parcel_type": parcel_type_field,
+            "parcel_value": self.parcel_type_value,
+            "parcel_global_id": global_id_field,
+            "area": area_field,
+            "width": width_field,
+        }
 
-        # # Parcels: join with grid, filter for specified parcel type
-        # filtered_parcel_layer = self._filter_with_grid(
-        #     parameters[self.PARCEL],
-        #     parameters, context, feedback)
+        parcel_clip_layer_with_area = self.add_geom_fields(
+                parcel_clip_layer, fields, feedback)
 
-        exp = QgsExpression(f"\"{parcel_type_field}\" = {parcel_type_value}")
-        request = QgsFeatureRequest(exp)
-        # Now we can filter by iterating through
-        # filtered_parcel_layer.getFeatures(request)
+        feedback.pushInfo("About to create spatial indexes")
+        processing.run("native:createspatialindex",
+                       {'INPUT':address_clip_layer})
+        processing.run("native:createspatialindex",
+                       {'INPUT':parcel_clip_layer_with_area})
+
+        feedback.pushInfo("About to do the join")
+
+        # Have to save the layer or we can't specify we should skip invalid
+        # geometries
+        # Why there are invalid geometries is left as an exercise to the
+        # reader; doing these steps via the GUI doesn't give any issues :(
+        # TODO: fixed the invalid geometry thing, remove this new layer
+        QgsProject.instance().addMapLayer(parcel_clip_layer_with_area)
+        address_with_parcel_layer = processing.run(
+            "native:joinattributesbylocation",
+            {'INPUT':address_clip_layer,
+             'PREDICATE':[0],
+             'JOIN':QgsProcessingFeatureSourceDefinition(
+                 parcel_clip_layer_with_area.source(),
+                 selectedFeaturesOnly=False,
+                 featureLimit=-1,
+                 flags=QgsProcessingFeatureSourceDefinition.FlagOverrideDefaultGeometryCheck,
+                 geometryCheck=QgsFeatureRequest.GeometrySkipInvalid),
+             'JOIN_FIELDS':[],
+             'METHOD':0,
+             'DISCARD_NONMATCHING':False,
+             'PREFIX':'',
+             'OUTPUT':'TEMPORARY_OUTPUT'},
+            context=context,
+            feedback=feedback)["OUTPUT"]
+
+        feedback.pushInfo(f"Joined layer: {address_with_parcel_layer}")
+
+        self.parcel_dict = self.get_parcels(parcel_clip_layer_with_area,
+                                            fields, feedback)
+
+        address_points = self.get_address_points(address_with_parcel_layer,
+                                                 fields, feedback)
+
+        output_layer_objects = self.get_output_layer_objects(
+                address_points, feedback)
+
+        # Process these python objects back into QGIS layers
+        for boring_address in output_layer_objects.boring_addresses:
+            feature = QgsFeature(self.output_fields[self.ADDRESS_POINTS])
+            feature.setAttributes([boring_address.label])
+            feature.setGeometry(boring_address.point)
+            self.address_points_sink.addFeature(feature,
+                                                QgsFeatureSink.FastInsert)
+
+        for dense_address_polygon in output_layer_objects.dense_address_polygons:
+            feature = QgsFeature(self.output_fields[self.ADDRESS_POLYGONS])
+            feature.setAttributes([dense_address_polygon.label])
+            feature.setGeometry(dense_address_polygon.polygon)
+            self.address_polygons_sink.addFeature(
+                    feature, QgsFeatureSink.FastInsert)
+
+        for wrapper_polygon in output_layer_objects.wrapper_polygons:
+            feature = QgsFeature(self.output_fields[self.WRAPPER_POLYGONS])
+            feature.setAttributes([wrapper_polygon.label,
+                                   wrapper_polygon.scope])
+            feature.setGeometry(wrapper_polygon.polygon)
+            self.wrapper_polygons_sink.addFeature(
+                    feature, QgsFeatureSink.FastInsert)
+
+        for sub_address_point in output_layer_objects.sub_address_points:
+            feature = QgsFeature(self.output_fields[self.ADDRESS_SUB_POINTS])
+            feature.setAttributes([sub_address_point.label])
+            feature.setGeometry(sub_address_point.point)
+            self.address_sub_points_sink.addFeature(
+                    feature, QgsFeatureSink.FastInsert)
 
         # First pass: just return address points
-        address_layer = address_source
-        for feature in address_layer.getFeatures():
-            feature.setFields(address_layer.fields(), False)
-            address_number = feature[street_number_field]
-            address_geometry = feature.geometry()
-            # Make sure order matches field definition above
-            attributes = [
-                address_number,
-            ]
-            feature = QgsFeature(self.output_fields[self.ADDRESS_POINTS])
-            feature.setAttributes(attributes)
-            feature.setGeometry(address_geometry)
-            self.address_points_sink.addFeature(feature, QgsFeatureSink.FastInsert)
+        # address_layer = address_source
+        # for feature in address_layer.getFeatures():
+        #     feature.setFields(address_layer.fields(), False)
+        #     address_number = feature[street_number_field]
+        #     address_geometry = feature.geometry()
+        #     # Make sure order matches field definition above
+        #     attributes = [
+        #         address_number,
+        #     ]
+        #     feature = QgsFeature(self.output_fields[self.ADDRESS_POINTS])
+        #     feature.setAttributes(attributes)
+        #     feature.setGeometry(address_geometry)
+        #     self.address_points_sink.addFeature(feature, QgsFeatureSink.FastInsert)
 
-        return dest_ids
-
-        ##############################################################
-
-
-        address_with_grid_layer = self._perform_joins(
-            parameters[self.ADDRESS], parameters, context, feedback
-        )
-
-        street_with_grid_layer = self._perform_joins(
-            parameters[self.STREETS], parameters, context, feedback
-        )
-
-        address_info_dict = self.digest_address_points(
-            address_with_grid_layer,
-            {
-                "map_id": name_field,
-                "street_number": street_number_field,
-                "shelter_bay": shelter_bay_field,
-                "extra_map_name": extra_map_name_field,
-                "district": district_field,
-                "street_name_expression": address_street_name_expression,
-            },
-            feedback,
-        )
-
-        street_info_dict = self.digest_address_points(
-            street_with_grid_layer,
-            {
-                "map_id": name_field,
-                "shelter_bay": shelter_bay_field,
-                "extra_map_name": extra_map_name_field,
-                "district": district_field,
-                "street_name_expression": street_name_expression,
-            },
-            feedback,
-            apply_map=True,
-        )
-
-        address_streets = {street for street, _ in address_info_dict.keys()}
-        street_streets = {street for street, _ in street_info_dict.keys()}
-        feedback.pushInfo(f"address produces {len(address_streets)} streets")
-        feedback.pushInfo(f"streets produce {len(street_streets)} streets")
-        feedback.pushInfo(
-            f"present in address but not streets: {address_streets - street_streets}"
-        )
-        feedback.pushInfo(
-            f"present in streets but not address: {street_streets - address_streets}"
-        )
-
-        # Merge streets dicts into address point dicts, without overriding
-        # existing values. Note that order of args to | matters!
-        # >>> a = {('a', 'r6a'): {3, 4, 5}, ('a', 'r5a'): {1, 2}}
-        # >>> b = {('a', 'r6a'): {}, ('a', 'r4a'): {}}
-        # >>> a | b
-        # {('a', 'r6a'): {}, ('a', 'r5a'): {1, 2}, ('a', 'r4a'): {}}
-        # >>> b | a
-        # {('a', 'r6a'): {3, 4, 5}, ('a', 'r4a'): {}, ('a', 'r5a'): {1, 2}}
-        # Basically the second arg is the one whose values will "override"
-        # those of the first
-        address_info_dict = street_info_dict | address_info_dict
-
-        address_info = self.order_address_table(address_info_dict)
-
-        for (street_name, map_id), address_info in address_info:
-            if street_name in self.address_to_street_name_map:
-                table_street_name = self.address_to_street_name_map[street_name]
-            else:
-                table_street_name = street_name
-
-            if address_info.extra_maps:
-                feedback.pushInfo(f"Address info has extra map(s): {address_info}")
-                map_id += "*"
-
-            # Generate notes. In particular the ALL ADDRESSES entry
-            # requires a global check of other grid tiles, so it has to
-            # live here instead of AddressInfo
-            address_info.generate_simple_notes()
-            if len(address_info.addresses) > 0:
-                all_grids_for_street = [
-                    grid_tile
-                    for street, grid_tile in address_info_dict.keys()
-                    if street == street_name
-                ]
-                if len(all_grids_for_street) == 1:
-                    # intentionally override even/odd only, since all addresses
-                    # is strictly more informative
-                    address_info.notes = ["ALL ADDRESSES"]
-
-            # Order of attributes matters! Make sure this matches order
-            # defined above
-            attributes = [
-                table_street_name,
-                address_info.districts_string,
-                address_info.min,
-                address_info.max,
-                address_info.notes_string,
-                map_id,
-            ]
-            feature = QgsFeature(self.output_fields)
-            feature.setAttributes(attributes)
-            self.sink.addFeature(feature, QgsFeatureSink.FastInsert)
-
-        # Return the results of the algorithm.
         return dest_ids
