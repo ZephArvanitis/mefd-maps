@@ -51,6 +51,9 @@ class AddressInfo:
                 f"{self.districts}, {self.custom_region}, "
                 f"{self.supplementary_info}, {self.extra_maps})")
 
+    def __repr__(self):
+        return str(self)
+
     def add_address(self, new_address):
         """Add address to container
         """
@@ -156,6 +159,9 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
 
     STREETS = "STREETS"
     STREET_FIELD = 'street_field'
+
+    POINTS_OF_INTEREST = "POINTS_OF_INTEREST"
+    POINTS_NAME = "points_name_field"
 
     OUTPUT = 'OUTPUT'
 
@@ -335,6 +341,23 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                 self.STREETS)
             )
 
+        # Points of interest (needed for e.g. "Sharpe Park" to appear in
+        # table)
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.POINTS_OF_INTEREST,
+                self.tr('Points of interest'),
+                [QgsProcessing.TypeVectorPoint]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterExpression(
+                self.POINTS_NAME,
+                'Name for the point',
+                '',
+                self.POINTS_OF_INTEREST)
+            )
+
         # We add a feature sink in which to store our processed features (this
         # usually takes the form of a newly created vector layer when the
         # algorithm is run in QGIS).
@@ -470,6 +493,26 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             context)
         street_name_expression = QgsExpression(street_name_exp_str)
         return (streets_source, street_name_expression)
+
+    def _get_point_inputs(self, parameters, context):
+        """Get point of interest-related inputs
+        """
+        points_source = self.parameterAsSource(
+            parameters,
+            self.POINTS_OF_INTEREST,
+            context
+        )
+        if points_source is None:
+            raise QgsProcessingException(
+                self.invalidSourceError(parameters, self.POINTS_OF_INTEREST)
+            )
+
+        point_name_exp_str = self.parameterAsString(
+            parameters,
+            self.POINTS_NAME,
+            context)
+        point_name_expression = QgsExpression(point_name_exp_str)
+        return (points_source, point_name_expression)
 
     def _configure_sink(self, parameters, context, crs):
         """Configure output layer
@@ -615,7 +658,7 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         # First, do unambiguous substitutions
         for key, update in self.STREET_TO_ADDRESS_NAME_MAP.items():
             if re.search(key, updated_street_name) is not None:
-                feedback.pushInfo(f"Updating {key} -> {update} in {updated_street_name}")
+                feedback.pushInfo(f"Updating '{key}' -> '{update}' in {updated_street_name}")
                 updated_street_name = re.sub(key, update,
                                              updated_street_name)
         # Now do substitutions to make street names match address point
@@ -739,6 +782,9 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
             (street1, grid1), info1 = item1
             (street2, grid2), info2 = item2
 
+            street1 = street1.upper()
+            street2 = street2.upper()
+
             # Last, if start address and street name match, use map page to
             # decide order
             if street1 == street2 and info1.min == info2.min:
@@ -798,23 +844,38 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         _, street_name_expression = self._get_street_inputs(
                 parameters, context)
 
+        _, point_name_expression = self._get_point_inputs(
+                parameters, context)
+
         dest_ids = self._configure_sink(parameters, context, address_source.sourceCrs())
 
         # Send some information to the user
         grid_crs = grid_source.sourceCrs().authid()
         address_crs = address_source.sourceCrs().authid()
-        feedback.pushInfo(f"LOOK IT UPDATED")
         feedback.pushInfo(
             f'Grid CRS is {grid_crs}, Address CRS is {address_crs}')
 
+        feedback.pushInfo("About to process points of interest")
+        points_with_grid_layer = self._perform_joins(
+                    parameters[self.POINTS_OF_INTEREST],
+                    parameters, context, feedback)
+        points_info_dict = self.digest_address_points(
+                points_with_grid_layer,
+                {"map_id": name_field,
+                 "shelter_bay": shelter_bay_field,
+                 "extra_map_name": extra_map_name_field,
+                 "district": district_field,
+                 "street_name_expression": point_name_expression}, feedback)
+
+
+        feedback.pushInfo(f"Got points of interest: {points_info_dict}")
+        for key, val in points_info_dict:
+            feedback.pushInfo(f"    {key} -> {val}")
+
+        feedback.pushInfo("About to process address points")
         address_with_grid_layer = self._perform_joins(parameters[self.ADDRESS],
                                                       parameters, context,
                                                       feedback)
-
-        street_with_grid_layer = self._perform_joins(parameters[self.STREETS],
-                                                     parameters, context,
-                                                     feedback)
-
         address_info_dict = self.digest_address_points(
                 address_with_grid_layer,
                 {"map_id": name_field,
@@ -824,6 +885,10 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
                  "district": district_field,
                  "street_name_expression": address_street_name_expression}, feedback)
 
+        feedback.pushInfo("About to process streets layer")
+        street_with_grid_layer = self._perform_joins(parameters[self.STREETS],
+                                                     parameters, context,
+                                                     feedback)
         street_info_dict = self.digest_address_points(
                 street_with_grid_layer,
                 {"map_id": name_field,
@@ -850,11 +915,18 @@ class AddressRangeTableProcessingAlgorithm(QgsProcessingAlgorithm):
         # {('a', 'r6a'): {3, 4, 5}, ('a', 'r4a'): {}, ('a', 'r5a'): {1, 2}}
         # Basically the second arg is the one whose values will "override"
         # those of the first
-        address_info_dict = street_info_dict | address_info_dict
+        feedback.pushInfo(f"Points keys {points_info_dict.keys()}, "
+                          f"streets {street_info_dict.keys()}, "
+                          f"addresses {address_info_dict.keys()}")
+        address_info_dict = points_info_dict | street_info_dict | address_info_dict
+        feedback.pushInfo(f"Joined info dict keys {address_info_dict.keys()}")
 
         address_info = self.order_address_table(address_info_dict)
 
         for (street_name, map_id), address_info in address_info:
+            if not street_name:
+                continue
+            street_name = street_name.upper()
             if street_name in self.address_to_street_name_map:
                 table_street_name = self.address_to_street_name_map[street_name]
             else:
